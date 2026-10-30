@@ -1,0 +1,32 @@
+name: Release
+
+# 推送 v* 格式的 tag 时自动打包并创建 Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package zip
+        run: |
+          mkdir -p dist/CDriveCleaner
+          cp CleanCDrive.ps1 clean-targets.json dist/CDriveCleaner/
+          # start.bat 规避 zip 中文文件名编码问题
+          cp "启动.bat" dist/CDriveCleaner/start.bat
+          cd dist
+          zip -r "CDriveCleaner-${{ github.ref_name }}.zip" CDriveCleaner
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

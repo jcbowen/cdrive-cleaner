@@ -1,0 +1,8 @@
+# 运行时产物
+.update_tmp/
+*.log
+
+# 系统文件
+desktop.ini
+Thumbs.db
+.DS_Store
