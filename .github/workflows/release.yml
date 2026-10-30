@@ -20,8 +20,8 @@ jobs:
         run: |
           mkdir -p dist/CDriveCleaner
           cp CleanCDrive.ps1 clean-targets.json dist/CDriveCleaner/
-          # start.bat 规避 zip 中文文件名编码问题
-          cp "启动.bat" dist/CDriveCleaner/start.bat
+          # start.bat 规避 zip 中文文件名编码问题(仓库内即英文名,直接复制)
+          cp start.bat dist/CDriveCleaner/start.bat
           cd dist
           zip -r "CDriveCleaner-${{ github.ref_name }}.zip" CDriveCleaner
 

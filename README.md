@@ -27,6 +27,7 @@
 | `CleanCDrive.ps1` | 主脚本(单文件,内嵌可视化页面) |
 | `clean-targets.json` | 自定义清理项配置(含字段说明) |
 | `启动.bat` | 启动入口(自动以 UTF-8 输出运行主脚本) |
+| `start.bat` | `启动.bat` 的英文副本(jsdelivr 不支持下载中文文件名,升级链路使用) |
 
 ## 发布流程
 
@@ -36,7 +37,7 @@
 ## 升级机制(国内网络优化)
 
 - 版本检测:GitHub API 优先,失败自动回退 jsdelivr 读取 main 分支 `version.txt`(3 个 CDN 节点轮询)
-- 升级下载:优先 jsdelivr 国内 CDN 逐文件下载(仅需主脚本与启动 bat 两个小文件)→ 备用节点 → GitHub Release zip 直连 → zipball 兜底,全部失败才提示检查网络
+- 升级下载:优先 jsdelivr 国内 CDN 逐文件下载(仅需主脚本与启动 bat 两个小文件;bat 走英文名 `start.bat`,jsdelivr 对中文文件名返回 403)→ 备用节点 → GitHub Release zip 直连 → zipball 兜底,全部失败才提示检查网络
 - 升级全程后台进行,下载不阻塞页面;服务短暂重启后页面自动恢复;用户配置 `clean-targets.json` 始终保留
 
 ## License
