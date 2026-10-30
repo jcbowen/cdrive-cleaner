@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.0.5'
+$script:Version = '1.0.6'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
@@ -879,16 +879,24 @@ $script:UpgradeBody = {
         $extract = Join-Path $tmp 'new'
         $tag = ('' + $u.version).TrimStart('v')
         $ok = $false
-        # 源1-3:jsdelivr 国内 CDN,逐文件下载(升级仅需主脚本与启动 bat 两个小文件;
-        # bat 取英文名 start.bat——jsdelivr 对中文文件名返回 403,部署时仍落盘为 启动.bat)
+        # 源1-3:jsdelivr 国内 CDN(升级仅需下载主脚本;jsdelivr 对 .bat/.exe 等可执行扩展名有黑名单,
+        # 经实测返回 403,故启动 bat 由升级器按仓库内容本地生成,不参与远程下载)
         foreach ($cdn in @('https://cdn.jsdelivr.net', 'https://testingcf.jsdelivr.net', 'https://fastly.jsdelivr.net')) {
             try {
                 Reset-Dir (Join-Path $extract 'CDriveCleaner')
                 $f1 = Join-Path $extract 'CDriveCleaner\CleanCDrive.ps1'
-                $f2 = Join-Path $extract 'CDriveCleaner\启动.bat'
                 $r1 = Save-Url "$cdn/gh/$repo@v$tag/CleanCDrive.ps1" $f1 30
-                $r2 = Save-Url "$cdn/gh/$repo@v$tag/start.bat" $f2 30
-                if ($r1 -and $r2) { $ok = $true; break }
+                if ($r1) {
+                    $bat = @'
+@echo off
+title C Drive Cleaner
+cd /d "%~dp0"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "CleanCDrive.ps1"
+pause
+'@
+                    Set-Content -Path (Join-Path $extract 'CDriveCleaner\start.bat') -Value $bat -Encoding ASCII
+                    $ok = $true; break
+                }
             } catch { }
         }
         # 源4-5:GitHub 直连 zip(Release 资产 / zipball 回退)
