@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.1.1'
+$script:Version = '1.1.2'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
@@ -620,6 +620,7 @@ var st = {state:'init', results:[], disk:null, clean:{state:'idle'}, isadmin:fal
 var sel = {};
 var upgrading = false, disconnected = false, upgHidden = false;
 var checking = false;
+var bootVer = '';
 var TITLE = 'C盘清理助手';
 
 function checkUpd(){
@@ -798,9 +799,10 @@ window.addEventListener('beforeunload', function(e){
 
 function poll(){
   fetch('/api/status').then(function(r){ return r.json(); }).then(function(d){
-    if (upgrading && disconnected) { location.reload(); return; }
+    if (upgrading && (disconnected || (bootVer && st.version && st.version !== bootVer))) { location.reload(); return; }
     var prevClean = st.clean ? st.clean.state : 'idle';
     st = d;
+    if (st.version) { document.getElementById('ver').textContent = ' · v' + st.version; }
     if (upgrading && st.update && st.update.phase === 'error') {
       upgrading = false;
       document.getElementById('updmask').style.display = 'none';
@@ -832,6 +834,7 @@ function poll(){
 }
 fetch('/api/status').then(function(r){ return r.json(); }).then(function(d){
   st = d;
+  bootVer = d.version || '';
   document.getElementById('port').textContent = ' · 127.0.0.1:' + d.port;
   document.getElementById('ver').textContent = d.version ? ' · v' + d.version : '';
   render(); poll();
@@ -943,7 +946,7 @@ function Get-StatusPayload {
 
 # 升级线程主体:多源下载(国内 CDN 优先,逐文件;GitHub zip 兜底)→ 生成并启动升级器 → 置位停机信号
 $script:UpgradeBody = {
-    param($sync, $dest, $repo)
+    param($sync, $dest, $repo, $port)
     $u = $sync.Update
     $u.phase = 'downloading'; $u.error = ''
     $tmp = Join-Path $dest '.update_tmp'
@@ -995,7 +998,7 @@ Start-Sleep -Milliseconds 500
 Copy-Item -Path '$srcDir\CleanCDrive.ps1' -Destination '$dest' -Force
 Start-Sleep -Milliseconds 300
 Remove-Item -Path '$tmp' -Recurse -Force -ErrorAction SilentlyContinue
-Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$dest\CleanCDrive.ps1`"",'-NoBrowser'
+Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$dest\CleanCDrive.ps1`"",'-NoBrowser','-StartPort',$port
 "@
         Set-Content -Path $up -Value $content -Encoding UTF8
         Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$up`"" -WindowStyle Hidden
@@ -1026,7 +1029,7 @@ function Start-Upgrade {
     if (-not $u -or -not $u.available) { return @{ ok = $false; error = '没有可用更新' } }
     if ($u.phase -eq 'downloading') { return @{ ok = $false; error = '升级下载已在进行中' } }
     $ps = [powershell]::Create()
-    [void]$ps.AddScript($script:UpgradeBody).AddArgument($script:Sync).AddArgument($PSScriptRoot).AddArgument($script:Repo)
+    [void]$ps.AddScript($script:UpgradeBody).AddArgument($script:Sync).AddArgument($PSScriptRoot).AddArgument($script:Repo).AddArgument($script:Port)
     [void]$ps.BeginInvoke()
     return @{ ok = $true; phase = 'downloading' }
 }
