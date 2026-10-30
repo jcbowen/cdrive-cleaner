@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.1.0'
+$script:Version = '1.1.1'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
@@ -35,10 +35,53 @@ $script:Repo    = 'jcbowen/cdrive-cleaner'
 $script:ConfigPath = Join-Path -Path $PSScriptRoot -ChildPath 'clean-targets.json'
 $script:DriveName  = 'C'
 
+# start.bat 标准启动入口模板(bat 自愈基准)。
+# 升级仅分发主脚本 ps1(jsdelivr 对 .bat 扩展名有下载黑名单),bat 内容随主脚本内置、间接随版本升级。
+# 模板保持纯 ASCII,以 ANSI 编码写出,规避 cmd 代码页解析问题。
+$script:StartBatTemplate = @'
+@echo off
+title C Drive Cleaner
+cd /d "%~dp0"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "CleanCDrive.ps1"
+pause
+'@
+
 # 判断当前是否以管理员身份运行
 # 返回值：$true=管理员；$false=普通权限
 $principal  = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 $script:IsAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+#endregion
+
+#region ---------------- 启动入口自愈 ----------------
+
+<#
+.SYNOPSIS
+    校验并修复 start.bat 启动入口(自愈)
+.DESCRIPTION
+    将脚本同目录的 start.bat 与内置模板比对(换行差异不视为不同):
+    内容不一致或文件缺失时重写为标准内容(CRLF + ANSI,cmd 可直接解析);
+    一致则不写盘,避免重写"正在被执行的 bat"导致 cmd 读取偏移错位。
+    已知边界:旧 bat 被重写后,当前正在执行它的 cmd 窗口在服务退出后
+    可能读到错位内容、报一行错误后关闭,不影响服务与下次启动。
+.PARAMETER 无
+.EXAMPLE
+    Repair-StartBat
+#>
+function Repair-StartBat {
+    $bat = Join-Path -Path $PSScriptRoot -ChildPath 'start.bat'
+    # 期望内容:模板统一为 LF 归一化后比对,写入时统一为 CRLF(Windows bat 规范)
+    $expected = ($script:StartBatTemplate -replace "`r`n", "`n").TrimEnd("`n") + "`n"
+    $actual = ''
+    try { if (Test-Path -LiteralPath $bat) { $actual = [IO.File]::ReadAllText($bat) } } catch { }
+    if (($actual -replace "`r`n", "`n") -eq $expected) { return }
+    try {
+        [IO.File]::WriteAllText($bat, ($expected -replace "`n", "`r`n"), [Text.Encoding]::ASCII)
+        Write-Host '  start.bat 已修复为标准启动入口。' -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  start.bat 修复失败(不影响本次运行)：$($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
 
 #endregion
 
@@ -1170,6 +1213,9 @@ $script:Sync.Update       = @{ available = $false; phase = 'idle'; error = ''; c
 $script:Sync.StopRequested = $false
 $script:StopRequested    = $false
 $script:Port             = $StartPort
+
+# 启动入口自愈:校验/修复 start.bat(内容随主脚本分发,详见 Repair-StartBat)
+Repair-StartBat
 
 # 绑定本地监听端口(被占用则向后尝试 10 个);
 # 若探测到已有本工具实例在运行,则直接打开现有页面并退出(单实例模式)

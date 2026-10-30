@@ -36,7 +36,7 @@
 ## 升级机制(国内网络优化)
 
 - 版本检测:GitHub API 优先,失败自动回退 jsdelivr 读取 main 分支 `version.txt`(3 个 CDN 节点轮询)
-- 升级下载:优先 jsdelivr 国内 CDN 下载主脚本(单文件)→ 备用节点 → GitHub Release zip 直连 → zipball 兜底,全部失败才提示检查网络。启动 bat 为固定入口不随版本变化,不参与升级;jsdelivr 对 .bat/.exe 等可执行扩展名有黑名单(实测 403)
+- 升级下载:优先 jsdelivr 国内 CDN 下载主脚本(单文件)→ 备用节点 → GitHub Release zip 直连 → zipball 兜底,全部失败才提示检查网络。启动 bat 不从网络下载(jsdelivr 对 .bat/.exe 等可执行扩展名有黑名单,实测 403),其标准内容内置于主脚本、随版本间接升级:服务每次启动时自动校验本地 `start.bat` 与内置模板,旧版/缺失自动修复重建(自愈)
 - 升级全程后台进行,下载不阻塞页面;服务短暂重启后页面自动恢复;用户配置 `clean-targets.json` 始终保留
 
 ## License
