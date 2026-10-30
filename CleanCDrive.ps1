@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.0.8'
+$script:Version = '1.0.9'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
@@ -914,7 +914,7 @@ Start-Sleep -Milliseconds 500
 Copy-Item -Path '$srcDir\CleanCDrive.ps1' -Destination '$dest' -Force
 Start-Sleep -Milliseconds 300
 Remove-Item -Path '$tmp' -Recurse -Force -ErrorAction SilentlyContinue
-Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"'$dest\CleanCDrive.ps1'",'-NoBrowser'
+Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$dest\CleanCDrive.ps1`"",'-NoBrowser'
 "@
         Set-Content -Path $up -Value $content -Encoding UTF8
         Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$up`"" -WindowStyle Hidden
