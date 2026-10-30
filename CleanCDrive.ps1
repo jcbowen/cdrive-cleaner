@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.0.0'
+$script:Version = '1.0.1'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
