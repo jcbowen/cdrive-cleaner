@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.0.9'
+$script:Version = '1.1.0'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
@@ -292,14 +292,15 @@ $script:UpdateCheckBody = {
         }
     }
     if (-not $latest) {
-        $sync.Update = @{ available = $false; phase = 'idle'; error = ''; current = [string]$cur; version = ''; assetUrl = ''; zipballUrl = '' }
+        # 检测失败:写入 error 供手动检查时反馈给用户(启动自动检测时该字段不影响页面)
+        $sync.Update = @{ available = $false; phase = 'idle'; error = '版本检测失败，请检查网络后重试'; current = [string]$cur; version = ''; assetUrl = ''; zipballUrl = '' }
         return
     }
     $newer = $false
     try { $newer = [version]$latest -gt [version]$cur } catch { }
     $sync.Update = @{
         available  = $newer
-        phase      = if ($sync.Update.phase) { $sync.Update.phase } else { 'idle' }
+        phase      = if ($sync.Update.phase -eq 'downloading') { 'downloading' } else { 'idle' }
         error      = ''
         current    = [string]$cur
         version    = "v$latest"
@@ -313,6 +314,17 @@ function Start-UpdateCheck {
     $ps = [powershell]::Create()
     [void]$ps.AddScript($script:UpdateCheckBody).AddArgument($script:Sync).AddArgument($script:Repo).AddArgument($script:Version)
     [void]$ps.BeginInvoke()
+}
+
+# 手动触发版本检查(页面"检查更新"按钮):置位 checking 状态后异步执行,结果经 /api/status 轮询获取
+# 返回值:@{ok=$true; phase='checking'} 已发起;@{ok=$false; error=...} 升级中/重复触发被拒
+function Start-ManualCheck {
+    $u = $script:Sync.Update
+    if ($u.phase -eq 'downloading') { return @{ ok = $false; error = '升级下载进行中，请稍后再试' } }
+    if ($u.phase -eq 'checking') { return @{ ok = $false; error = '版本检查已在进行中' } }
+    $u.phase = 'checking'; $u.error = ''
+    Start-UpdateCheck
+    return @{ ok = $true; phase = 'checking' }
 }
 
 function Start-Scan {
@@ -549,7 +561,7 @@ footer{position:fixed;left:0;right:0;bottom:0;background:rgba(15,23,42,.92);back
 <div id="progress"><span id="ptext"></span><div class="pbar"><i id="pfill"></i></div></div>
 <main id="main"><div class="empty">正在启动扫描…</div></main>
 <footer>
-  <div class="selinfo">已选 <b id="selc">0</b> 项 · 预计释放 <b id="selsz">0 B</b></div>
+  <div class="selinfo">已选 <b id="selc">0</b> 项 · 预计释放 <b id="selsz">0 B</b><span id="ver" style="opacity:.75"></span> <button class="mini" id="chkbtn" onclick="checkUpd()">检查更新</button></div>
   <div class="btns">
     <button class="btn lockable" onclick="selSafe()">全选安全项</button>
     <button class="btn lockable" onclick="selNone()">清空选择</button>
@@ -564,7 +576,18 @@ footer{position:fixed;left:0;right:0;bottom:0;background:rgba(15,23,42,.92);back
 var st = {state:'init', results:[], disk:null, clean:{state:'idle'}, isadmin:false, total:0, done:0, current:''};
 var sel = {};
 var upgrading = false, disconnected = false, upgHidden = false;
+var checking = false;
 var TITLE = 'C盘清理助手';
+
+function checkUpd(){
+  if (checking) return;
+  api('/api/check-update', {}).then(function(r){
+    if (!r.ok) { toast(r.error || '无法发起检查'); return; }
+    checking = true;
+    var b = document.getElementById('chkbtn');
+    b.disabled = true; b.textContent = '检查中…';
+  }).catch(function(){ toast('检查请求失败'); });
+}
 
 function fmt(b){
   if (b == null) return '0 B';
@@ -743,6 +766,19 @@ function poll(){
     if (upgrading && st.update && st.update.phase === 'deployed') {
       document.getElementById('updmsg').textContent = '升级部署完成，服务重启中，页面将自动恢复…';
     }
+    if (checking && st.update && st.update.phase !== 'checking') {
+      checking = false;
+      var cb = document.getElementById('chkbtn');
+      cb.disabled = false; cb.textContent = '检查更新';
+      if (st.update.available) {
+        upgHidden = false;
+        toast('发现新版本 ' + st.update.version);
+      } else if (st.update.error) {
+        toast('检查失败：' + st.update.error);
+      } else {
+        toast('已是最新版本 v' + (st.version || st.update.current));
+      }
+    }
     if (prevClean === 'running' && st.clean.state === 'done') {
       var rel = st.lastReleased;
       toast('清理完成' + (rel ? '，共释放 ' + fmt(rel) : ''));
@@ -754,6 +790,7 @@ function poll(){
 fetch('/api/status').then(function(r){ return r.json(); }).then(function(d){
   st = d;
   document.getElementById('port').textContent = ' · 127.0.0.1:' + d.port;
+  document.getElementById('ver').textContent = d.version ? ' · v' + d.version : '';
   render(); poll();
 });
 </script>
@@ -856,6 +893,7 @@ function Get-StatusPayload {
         lastReleased = [double]$script:Sync.LastReleased
         isadmin      = $script:IsAdmin
         port         = $script:Port
+        version      = [string]$script:Version
         update       = $script:Sync.Update
     }
 }
@@ -1076,6 +1114,10 @@ function Invoke-RequestHandler {
         if ($route -eq '/api/upgrade' -and $Ctx.Request.HttpMethod -eq 'POST') {
             if ($script:Sync.Clean.state -eq 'running') { Send-Json -Ctx $Ctx @{ ok = $false; error = '清理正在进行中，无法升级' }; return }
             Send-Json -Ctx $Ctx (Start-Upgrade)
+            return
+        }
+        if ($route -eq '/api/check-update' -and $Ctx.Request.HttpMethod -eq 'POST') {
+            Send-Json -Ctx $Ctx (Start-ManualCheck)
             return
         }
         if ($route -eq '/api/open' -and $Ctx.Request.HttpMethod -eq 'POST') {
