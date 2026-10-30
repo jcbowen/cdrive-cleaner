@@ -30,7 +30,14 @@
 
 ## 发布流程
 
-推送 `v*` 格式的 tag(如 `v1.0.1`)后,GitHub Actions 会自动打包 zip 并创建 Release,页面内的一键升级会优先从 Release 下载。
+1. 同步更新 `CleanCDrive.ps1` 内的版本号与根目录 `version.txt`
+2. 推送 `v*` 格式的 tag(如 `v1.0.3`)后,GitHub Actions 自动打包 zip 并创建 Release
+
+## 升级机制(国内网络优化)
+
+- 版本检测:GitHub API 优先,失败自动回退 jsdelivr 读取 main 分支 `version.txt`(3 个 CDN 节点轮询)
+- 升级下载:优先 jsdelivr 国内 CDN 逐文件下载(仅需主脚本与启动 bat 两个小文件)→ 备用节点 → GitHub Release zip 直连 → zipball 兜底,全部失败才提示检查网络
+- 升级全程后台进行,下载不阻塞页面;服务短暂重启后页面自动恢复;用户配置 `clean-targets.json` 始终保留
 
 ## License
 

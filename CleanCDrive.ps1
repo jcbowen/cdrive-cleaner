@@ -270,26 +270,41 @@ $script:ScanBody = {
 .EXAMPLE
     Start-Scan
 #>
-# 版本检测线程主体:查询 GitHub 最新 Release,与本地版本比对后写入 Sync.Update
+# 版本检测线程主体:GitHub API 优先,失败回退 jsdelivr 国内 CDN 读取 main 分支 version.txt
 $script:UpdateCheckBody = {
     param($sync, $repo, $cur)
+    $latest = ''
+    $asset = $null
+    $zipball = ''
     try {
         $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -TimeoutSec 8
         $latest = ('' + $rel.tag_name).TrimStart('v')
         $asset = @($rel.assets) | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
-        $newer = $false
-        try { $newer = [version]$latest -gt [version]$cur } catch { }
-        $sync.Update = @{
-            available  = $newer
-            phase      = if ($sync.Update.phase) { $sync.Update.phase } else { 'idle' }
-            error      = ''
-            current    = [string]$cur
-            version    = [string]$rel.tag_name
-            assetUrl   = if ($asset) { [string]$asset.browser_download_url } else { '' }
-            zipballUrl = [string]$rel.zipball_url
-        }
+        $zipball = [string]$rel.zipball_url
     } catch {
+        # API 不通时走 CDN 读版本文件(检测非关键路径,全失败则静默跳过)
+        foreach ($cdn in @('https://cdn.jsdelivr.net', 'https://testingcf.jsdelivr.net', 'https://fastly.jsdelivr.net')) {
+            try {
+                $txt = Invoke-WebRequest -Uri "$cdn/gh/$repo@main/version.txt" -TimeoutSec 8 -UseBasicParsing
+                $t = ('' + $txt.Content).Trim().TrimStart('v')
+                if ($t) { $latest = $t; break }
+            } catch { }
+        }
+    }
+    if (-not $latest) {
         $sync.Update = @{ available = $false; phase = 'idle'; error = ''; current = [string]$cur; version = ''; assetUrl = ''; zipballUrl = '' }
+        return
+    }
+    $newer = $false
+    try { $newer = [version]$latest -gt [version]$cur } catch { }
+    $sync.Update = @{
+        available  = $newer
+        phase      = if ($sync.Update.phase) { $sync.Update.phase } else { 'idle' }
+        error      = ''
+        current    = [string]$cur
+        version    = "v$latest"
+        assetUrl   = if ($asset) { [string]$asset.browser_download_url } else { '' }
+        zipballUrl = $zipball
     }
 }
 
@@ -845,32 +860,52 @@ function Get-StatusPayload {
     }
 }
 
-# 升级线程主体:下载新版本包(3 轮重试)→ 解压 → 生成并启动升级器 → 置位停机信号
+# 升级线程主体:多源下载(国内 CDN 优先,逐文件;GitHub zip 兜底)→ 生成并启动升级器 → 置位停机信号
 $script:UpgradeBody = {
-    param($sync, $dest)
+    param($sync, $dest, $repo)
     $u = $sync.Update
     $u.phase = 'downloading'; $u.error = ''
     $tmp = Join-Path $dest '.update_tmp'
+    function Reset-Dir([string]$p) {
+        if (Test-Path $p) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Path $p -Force | Out-Null
+    }
+    function Save-Url([string]$url, [string]$out, [int]$sec) {
+        Invoke-WebRequest -Uri $url -OutFile $out -TimeoutSec $sec -UseBasicParsing
+        return (Test-Path $out) -and ((Get-Item $out).Length -gt 0)
+    }
     try {
-        if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
-        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-        # 下载:优先 Release 资产,回退 zipball;共 3 轮重试
-        $zip = Join-Path $tmp 'update.zip'
-        $done = $false
-        foreach ($attempt in 1..3) {
+        Reset-Dir $tmp
+        $extract = Join-Path $tmp 'new'
+        $tag = ('' + $u.version).TrimStart('v')
+        $batEnc = [System.Uri]::EscapeDataString('启动.bat')
+        $ok = $false
+        # 源1-3:jsdelivr 国内 CDN,逐文件下载(升级仅需主脚本与启动 bat 两个小文件)
+        foreach ($cdn in @('https://cdn.jsdelivr.net', 'https://testingcf.jsdelivr.net', 'https://fastly.jsdelivr.net')) {
+            try {
+                Reset-Dir (Join-Path $extract 'CDriveCleaner')
+                $f1 = Join-Path $extract 'CDriveCleaner\CleanCDrive.ps1'
+                $f2 = Join-Path $extract 'CDriveCleaner\启动.bat'
+                $r1 = Save-Url "$cdn/gh/$repo@v$tag/CleanCDrive.ps1" $f1 30
+                $r2 = Save-Url "$cdn/gh/$repo@v$tag/$batEnc" $f2 30
+                if ($r1 -and $r2) { $ok = $true; break }
+            } catch { }
+        }
+        # 源4-5:GitHub 直连 zip(Release 资产 / zipball 回退)
+        if (-not $ok) {
             foreach ($url in @(@($u.assetUrl) | Where-Object { $_ }, $u.zipballUrl)) {
                 if (-not $url) { continue }
                 try {
-                    Invoke-WebRequest -Uri $url -OutFile $zip -TimeoutSec 180 -UseBasicParsing
-                    if ((Get-Item $zip).Length -gt 1KB) { $done = $true; break }
-                } catch { Start-Sleep -Seconds 2 }
+                    Reset-Dir $extract
+                    $zip = Join-Path $tmp 'update.zip'
+                    if (Save-Url $url $zip 90) {
+                        Expand-Archive -Path $zip -DestinationPath $extract -Force
+                        $ok = $true; break
+                    }
+                } catch { }
             }
-            if ($done) { break }
-            Start-Sleep -Seconds 3
         }
-        if (-not $done) { throw '下载新版本失败，请检查网络后重试' }
-        $extract = Join-Path $tmp 'new'
-        Expand-Archive -Path $zip -DestinationPath $extract -Force
+        if (-not $ok) { throw '所有下载源均失败，请检查网络后重试' }
         # 兼容两种包结构:Release zip(CDriveCleaner/...)与 zipball(仓库名-tag/...)
         $src = Get-ChildItem -Path $extract -Recurse -Filter 'CleanCDrive.ps1' | Select-Object -First 1
         if (-not $src) { throw '下载内容中未找到主脚本' }
@@ -914,7 +949,7 @@ function Start-Upgrade {
     if (-not $u -or -not $u.available) { return @{ ok = $false; error = '没有可用更新' } }
     if ($u.phase -eq 'downloading') { return @{ ok = $false; error = '升级下载已在进行中' } }
     $ps = [powershell]::Create()
-    [void]$ps.AddScript($script:UpgradeBody).AddArgument($script:Sync).AddArgument($PSScriptRoot)
+    [void]$ps.AddScript($script:UpgradeBody).AddArgument($script:Sync).AddArgument($PSScriptRoot).AddArgument($script:Repo)
     [void]$ps.BeginInvoke()
     return @{ ok = $true; phase = 'downloading' }
 }
