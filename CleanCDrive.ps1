@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.0.1'
+$script:Version = '1.0.2'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
@@ -281,13 +281,15 @@ $script:UpdateCheckBody = {
         try { $newer = [version]$latest -gt [version]$cur } catch { }
         $sync.Update = @{
             available  = $newer
+            phase      = if ($sync.Update.phase) { $sync.Update.phase } else { 'idle' }
+            error      = ''
             current    = [string]$cur
             version    = [string]$rel.tag_name
             assetUrl   = if ($asset) { [string]$asset.browser_download_url } else { '' }
             zipballUrl = [string]$rel.zipball_url
         }
     } catch {
-        $sync.Update = @{ available = $false; current = [string]$cur; version = ''; assetUrl = ''; zipballUrl = '' }
+        $sync.Update = @{ available = $false; phase = 'idle'; error = ''; current = [string]$cur; version = ''; assetUrl = ''; zipballUrl = '' }
     }
 }
 
@@ -700,15 +702,10 @@ function doUpgrade(){
   var mask = document.getElementById('updmask');
   mask.style.display = 'flex';
   document.getElementById('updmsg').textContent = '正在下载新版本 ' + u.version + '…';
+  upgrading = true;
   api('/api/upgrade', {}).then(function(r){
-    if (r.ok) {
-      upgrading = true;
-      document.getElementById('updmsg').textContent = '升级完成，服务重启中，页面将自动恢复…';
-      return fetch('/api/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
-    }
-    mask.style.display = 'none';
-    toast(r.error || '升级失败');
-  }).catch(function(){ mask.style.display = 'none'; toast('升级请求失败'); });
+    if (!r.ok) { upgrading = false; mask.style.display = 'none'; toast(r.error || '升级失败'); }
+  }).catch(function(){ upgrading = false; mask.style.display = 'none'; toast('升级请求失败'); });
 }
 
 window.addEventListener('beforeunload', function(e){
@@ -723,12 +720,20 @@ function poll(){
     if (upgrading && disconnected) { location.reload(); return; }
     var prevClean = st.clean ? st.clean.state : 'idle';
     st = d;
+    if (upgrading && st.update && st.update.phase === 'error') {
+      upgrading = false;
+      document.getElementById('updmask').style.display = 'none';
+      toast('升级失败: ' + (st.update.error || '未知错误'));
+    }
+    if (upgrading && st.update && st.update.phase === 'deployed') {
+      document.getElementById('updmsg').textContent = '升级部署完成，服务重启中，页面将自动恢复…';
+    }
     if (prevClean === 'running' && st.clean.state === 'done') {
       var rel = st.lastReleased;
       toast('清理完成' + (rel ? '，共释放 ' + fmt(rel) : ''));
     }
     render();
-  }).catch(function(){ disconnected = true; });
+  }).catch(function(){ disconnected = true; if (upgrading) { document.getElementById('updmsg').textContent = '服务重启中，等待恢复…'; } });
   setTimeout(poll, 800);
 }
 fetch('/api/status').then(function(r){ return r.json(); }).then(function(d){
@@ -840,38 +845,40 @@ function Get-StatusPayload {
     }
 }
 
-<#
-.SYNOPSIS
-    执行一键升级:下载新版本包并部署升级器
-.DESCRIPTION
-    优先从 GitHub Release 资产下载 zip,否则回退 zipball;解压后生成 upgrade.ps1
-    (等待当前进程退出、覆盖主脚本与启动 bat、保留用户配置 clean-targets.json、
-    清理临时目录并以 -NoBrowser 重启服务),随后启动升级器进程并返回。
-    实际文件覆盖由升级器在本服务退出后完成,页面经轮询自动刷新恢复。
-.EXAMPLE
-    $r = Start-Upgrade
-#>
-function Start-Upgrade {
-    $u = $script:Sync.Update
-    if (-not $u -or -not $u.available) { return @{ ok = $false; error = '没有可用更新' } }
-    $dest = $PSScriptRoot
-    $tmp  = Join-Path $dest '.update_tmp'
-    if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
-    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+# 升级线程主体:下载新版本包(3 轮重试)→ 解压 → 生成并启动升级器 → 置位停机信号
+$script:UpgradeBody = {
+    param($sync, $dest)
+    $u = $sync.Update
+    $u.phase = 'downloading'; $u.error = ''
+    $tmp = Join-Path $dest '.update_tmp'
     try {
-        $url = if ($u.assetUrl) { $u.assetUrl } else { $u.zipballUrl }
+        if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        # 下载:优先 Release 资产,回退 zipball;共 3 轮重试
         $zip = Join-Path $tmp 'update.zip'
-        Invoke-WebRequest -Uri $url -OutFile $zip -TimeoutSec 180 -UseBasicParsing
+        $done = $false
+        foreach ($attempt in 1..3) {
+            foreach ($url in @(@($u.assetUrl) | Where-Object { $_ }, $u.zipballUrl)) {
+                if (-not $url) { continue }
+                try {
+                    Invoke-WebRequest -Uri $url -OutFile $zip -TimeoutSec 180 -UseBasicParsing
+                    if ((Get-Item $zip).Length -gt 1KB) { $done = $true; break }
+                } catch { Start-Sleep -Seconds 2 }
+            }
+            if ($done) { break }
+            Start-Sleep -Seconds 3
+        }
+        if (-not $done) { throw '下载新版本失败，请检查网络后重试' }
         $extract = Join-Path $tmp 'new'
         Expand-Archive -Path $zip -DestinationPath $extract -Force
         # 兼容两种包结构:Release zip(CDriveCleaner/...)与 zipball(仓库名-tag/...)
         $src = Get-ChildItem -Path $extract -Recurse -Filter 'CleanCDrive.ps1' | Select-Object -First 1
-        if (-not $src) { return @{ ok = $false; error = '下载内容中未找到主脚本' } }
+        if (-not $src) { throw '下载内容中未找到主脚本' }
         $srcDir  = $src.DirectoryName
         $batName = if (Test-Path (Join-Path $srcDir 'start.bat')) { 'start.bat' } else { '启动.bat' }
         $up = Join-Path $tmp 'upgrade.ps1'
         $content = @"
-`$null = Wait-Process -Id $PID -Timeout 30 -ErrorAction SilentlyContinue
+`$null = Wait-Process -Id $PID -Timeout 60 -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 Copy-Item -Path '$srcDir\CleanCDrive.ps1' -Destination '$dest' -Force
 Copy-Item -Path '$srcDir\$batName' -Destination '$dest\启动.bat' -Force
@@ -881,10 +888,35 @@ Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypa
 "@
         Set-Content -Path $up -Value $content -Encoding UTF8
         Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$up`"" -WindowStyle Hidden
-        return @{ ok = $true }
+        # 请求主循环退出,由升级器完成覆盖与重启
+        $sync.StopRequested = $true
+        $u.phase = 'deployed'
     } catch {
-        return @{ ok = $false; error = $_.Exception.Message }
+        $u.phase = 'error'
+        $u.error = $_.Exception.Message
+        if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
+}
+
+<#
+.SYNOPSIS
+    发起一键升级:启动后台升级线程并立即返回
+.DESCRIPTION
+    后台线程(UpgradeBody)负责:下载新版本包(Release 资产优先,zipball 回退,3 轮重试)、
+    解压并生成升级器、启动升级器进程,最后置位 StopRequested 让服务自行退出;
+    升级器等待服务退出后覆盖文件(保留用户配置 clean-targets.json)并以 -NoBrowser 重启。
+    升级进度通过 Sync.Update.phase 汇报:downloading / deployed / error。
+.EXAMPLE
+    $r = Start-Upgrade
+#>
+function Start-Upgrade {
+    $u = $script:Sync.Update
+    if (-not $u -or -not $u.available) { return @{ ok = $false; error = '没有可用更新' } }
+    if ($u.phase -eq 'downloading') { return @{ ok = $false; error = '升级下载已在进行中' } }
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($script:UpgradeBody).AddArgument($script:Sync).AddArgument($PSScriptRoot)
+    [void]$ps.BeginInvoke()
+    return @{ ok = $true; phase = 'downloading' }
 }
 
 <#
@@ -1061,7 +1093,8 @@ $script:Sync.Results     = @()
 $script:Sync.Disk        = $null
 $script:Sync.Clean       = @{ state = 'idle'; done = 0; total = 0; current = '' }
 $script:Sync.LastReleased = [double]0
-$script:Sync.Update       = @{ available = $false; current = $script:Version; version = ''; assetUrl = ''; zipballUrl = '' }
+$script:Sync.Update       = @{ available = $false; phase = 'idle'; error = ''; current = $script:Version; version = ''; assetUrl = ''; zipballUrl = '' }
+$script:Sync.StopRequested = $false
 $script:StopRequested    = $false
 $script:Port             = $StartPort
 
@@ -1101,9 +1134,10 @@ Write-Host '==============================================' -ForegroundColor Cya
 Start-Scan
 if (-not $NoBrowser) { Start-Process -FilePath "http://127.0.0.1:$script:Port/" }
 
-# 主循环：阻塞处理请求，/api/stop 或 Ctrl+C 退出
+# 主循环：阻塞处理请求，/api/stop、Ctrl+C 或升级流程(后台线程置位 StopRequested)退出
 try {
     while ($script:Listener.IsListening -and -not $script:StopRequested) {
+        if ($script:Sync.StopRequested) { break }
         $ctx = $script:Listener.GetContext()
         Invoke-RequestHandler -Ctx $ctx
     }
