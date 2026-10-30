@@ -15,7 +15,7 @@
 ## 使用
 
 1. 下载本仓库 Release 中的 `CDriveCleaner-vX.Y.Z.zip` 并解压(或直接克隆仓库)
-2. 双击 `启动.bat`(zip 包内为 `start.bat`),浏览器会自动打开 `http://127.0.0.1:8765`
+2. 双击 `start.bat`,浏览器会自动打开 `http://127.0.0.1:8765`
 3. 扫描完成后勾选要清理的项目,点击"开始清理"
 
 注意:清理进行中请勿关闭脚本控制台窗口,否则清理会被中断;关闭浏览器页面不影响后台清理,重新打开页面即可恢复视图。
@@ -26,8 +26,7 @@
 |---|---|
 | `CleanCDrive.ps1` | 主脚本(单文件,内嵌可视化页面) |
 | `clean-targets.json` | 自定义清理项配置(含字段说明) |
-| `启动.bat` | 启动入口(自动以 UTF-8 输出运行主脚本) |
-| `start.bat` | `启动.bat` 的英文副本(GitHub Release zip 打包/下载使用,规避中文文件名编码问题) |
+| `start.bat` | 启动入口(双击运行,自动以 UTF-8 输出启动主脚本) |
 
 ## 发布流程
 
@@ -37,7 +36,7 @@
 ## 升级机制(国内网络优化)
 
 - 版本检测:GitHub API 优先,失败自动回退 jsdelivr 读取 main 分支 `version.txt`(3 个 CDN 节点轮询)
-- 升级下载:优先 jsdelivr 国内 CDN 下载主脚本(单文件)→ 备用节点 → GitHub Release zip 直连 → zipball 兜底,全部失败才提示检查网络。启动 bat 不参与远程下载(jsdelivr 对 .bat/.exe 等可执行扩展名有黑名单),由升级器按仓库内容本地生成
+- 升级下载:优先 jsdelivr 国内 CDN 下载主脚本(单文件)→ 备用节点 → GitHub Release zip 直连 → zipball 兜底,全部失败才提示检查网络。启动 bat 为固定入口不随版本变化,不参与升级;jsdelivr 对 .bat/.exe 等可执行扩展名有黑名单(实测 403)
 - 升级全程后台进行,下载不阻塞页面;服务短暂重启后页面自动恢复;用户配置 `clean-targets.json` 始终保留
 
 ## License

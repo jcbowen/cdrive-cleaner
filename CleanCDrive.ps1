@@ -3,7 +3,7 @@
     C盘清理助手 - 扫描并可视化清理 C 盘可释放空间
 
 .DESCRIPTION
-    双击"启动.bat"或运行本脚本后：
+    双击"start.bat"或运行本脚本后：
       1. 后台 Runspace 线程扫描内置 + clean-targets.json 中的自定义清理目标；
       2. 启动本地 HTTP 服务(默认 127.0.0.1:8765)并自动打开浏览器；
       3. 页面实时展示扫描进度、磁盘用量、各目标大小/用途说明；
@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.0.7'
+$script:Version = '1.0.8'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
@@ -879,24 +879,13 @@ $script:UpgradeBody = {
         $extract = Join-Path $tmp 'new'
         $tag = ('' + $u.version).TrimStart('v')
         $ok = $false
-        # 源1-3:jsdelivr 国内 CDN(升级仅需下载主脚本;jsdelivr 对 .bat/.exe 等可执行扩展名有黑名单,
-        # 经实测返回 403,故启动 bat 由升级器按仓库内容本地生成,不参与远程下载)
+        # 源1-3:jsdelivr 国内 CDN(升级只覆盖主脚本;jsdelivr 对 .bat/.exe 等可执行扩展名有黑名单,
+        # 经实测返回 403,而启动 bat 为固定入口不随版本变化,故 bat 不参与升级)
         foreach ($cdn in @('https://cdn.jsdelivr.net', 'https://testingcf.jsdelivr.net', 'https://fastly.jsdelivr.net')) {
             try {
                 Reset-Dir (Join-Path $extract 'CDriveCleaner')
                 $f1 = Join-Path $extract 'CDriveCleaner\CleanCDrive.ps1'
-                $r1 = Save-Url "$cdn/gh/$repo@v$tag/CleanCDrive.ps1" $f1 30
-                if ($r1) {
-                    $bat = @'
-@echo off
-title C Drive Cleaner
-cd /d "%~dp0"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "CleanCDrive.ps1"
-pause
-'@
-                    Set-Content -Path (Join-Path $extract 'CDriveCleaner\start.bat') -Value $bat -Encoding ASCII
-                    $ok = $true; break
-                }
+                if (Save-Url "$cdn/gh/$repo@v$tag/CleanCDrive.ps1" $f1 30) { $ok = $true; break }
             } catch { }
         }
         # 源4-5:GitHub 直连 zip(Release 资产 / zipball 回退)
@@ -917,14 +906,12 @@ pause
         # 兼容两种包结构:Release zip(CDriveCleaner/...)与 zipball(仓库名-tag/...)
         $src = Get-ChildItem -Path $extract -Recurse -Filter 'CleanCDrive.ps1' | Select-Object -First 1
         if (-not $src) { throw '下载内容中未找到主脚本' }
-        $srcDir  = $src.DirectoryName
-        $batName = if (Test-Path (Join-Path $srcDir 'start.bat')) { 'start.bat' } else { '启动.bat' }
+        $srcDir = $src.DirectoryName
         $up = Join-Path $tmp 'upgrade.ps1'
         $content = @"
 `$null = Wait-Process -Id $PID -Timeout 60 -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 Copy-Item -Path '$srcDir\CleanCDrive.ps1' -Destination '$dest' -Force
-Copy-Item -Path '$srcDir\$batName' -Destination '$dest\启动.bat' -Force
 Start-Sleep -Milliseconds 300
 Remove-Item -Path '$tmp' -Recurse -Force -ErrorAction SilentlyContinue
 Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"'$dest\CleanCDrive.ps1'",'-NoBrowser'
@@ -945,9 +932,10 @@ Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypa
 .SYNOPSIS
     发起一键升级:启动后台升级线程并立即返回
 .DESCRIPTION
-    后台线程(UpgradeBody)负责:下载新版本包(Release 资产优先,zipball 回退,3 轮重试)、
-    解压并生成升级器、启动升级器进程,最后置位 StopRequested 让服务自行退出;
-    升级器等待服务退出后覆盖文件(保留用户配置 clean-targets.json)并以 -NoBrowser 重启。
+    后台线程(UpgradeBody)负责:多源下载新主脚本(jsdelivr 国内 CDN 三节点轮询优先,
+    GitHub Release zip / zipball 兜底;启动 bat 为固定入口不参与升级)、
+    生成升级器并启动升级器进程,最后置位 StopRequested 让服务自行退出;
+    升级器等待服务退出后覆盖主脚本(保留用户配置 clean-targets.json 与启动 bat)并以 -NoBrowser 重启。
     升级进度通过 Sync.Update.phase 汇报:downloading / deployed / error。
 .EXAMPLE
     $r = Start-Upgrade
