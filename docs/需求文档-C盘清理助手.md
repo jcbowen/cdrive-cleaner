@@ -295,3 +295,38 @@ v1.3.0 实测检出 143 个"疑似卸载残留",经五项证据对比检测(path
 3. **分组落地**:`Set-TargetCat`(hashtable 加键 / pscustomobject 用 Add-Member,PS5.1 不允许直接赋值新增属性)+ `Merge-Targets` 打 cat;`ScanBody` 结果对象透传 cat 字段;前端 `groupCats()` 固定五组顺序(常规缓存/自定义目录/开发产物/疑似卸载残留/失效卸载注册表项),组头"N 项 · 合计 X",组内 size 降序,点击组头折叠(`grpOpen` 状态机,`grp.closed` CSS)。
 4. **实测**:服务端扫描 98 项全部携带 cat;可见 64 项 = orphan-dir 49(1.64GB) + builtin 9(407MB) + dev 5(370MB) + orphan-reg 1;浏览器 UI 实测分组渲染/组头统计/组内降序均正常,折叠经隔离状态机验证与 DOM 验证通过。
 5. **候选数说明**:验收预期 ~25 基于诊断脚本的失真 uninsExe 信号;实际 67 个均通过全部证据校验(无路径匹配、无厂商匹配、闲置 ≥90 天、不在排除清单),且清理方式为移入回收站可恢复,符合"宁可不报也不误报"之外的第二保守方向——报告的一律是高置信残留。
+
+## 十四、清理占用检测与处理(2026-11-03 确认,v1.5.0)
+
+### 1. 背景(用户原话痛点)
+"HBuilderX 是绿色安装没有卸载程序,我手动删除文件,它提示有程序在使用"。当前清理遇到文件被占用时只会跳过并提示"部分文件被占用跳过",用户不知道是谁占着、也没有后续手段,只能手动排查。绿色软件(无卸载程序)残留目录的清理场景尤其需要该能力。
+
+### 2. 方案(方案A:Windows 自带 Restart Manager API,零依赖)
+1. **占用进程查询**:封装 `rstrtmgr.dll`(RmStartSession / RmRegisterResources / RmGetList / RmEndSession)。目录目标先递归采样最多 200 个文件路径注册到 RM 会话,再查询占用进程列表(PID + 进程名 + 应用类型),按 PID 去重;
+2. **结果回填**:清理某项目删除失败(疑似占用)时调用检测,结果对象回填 `lockedBy = [{pid, name, type}]` 字段,`/api/status` 透传;
+3. **前端展示**:条目下显示"文件被占用:xxx.exe (PID 1234)"提示行,并提供「结束占用进程并重试」按钮;
+4. **关键进程保护**:System / smss / csrss / wininit / winlogon / services / lsass / svchost / dwm / fontdrvhost 等系统关键进程只提示不可结束(按钮对该进程禁用);explorer.exe 允许结束但提示会短暂重启资源管理器;
+5. **结束进程并重试**:新增 `/api/kill` 接口(入参 id + pids 数组,校验 pid 确实在该条目 lockedBy 中防止滥用),结束进程后自动以该 id 触发一次重新清理(等效重试);
+6. **覆盖场景**:toRecycle(残留目录移入回收站失败)与 deleteContents(自定义目录/内置缓存/开发产物删除失败)两类动作均接入。
+
+### 3. 验收标准
+- [x] 启动测试进程占用测试目录内文件 → 清理该目录 → 条目显示占用提示与占用进程名/PID;
+- [x] 点击「结束占用进程并重试」→ 进程被结束、目录自动重新清理成功、状态变为已清理;
+- [x] 系统关键进程占用时按钮禁用并提示不可结束;占用信息不误报不漏报;
+- [x] 发版 v1.5.0,README 同步。
+
+### 4. 执行结果
+
+已于 2026-11-03 完成开发与验证,随 v1.5.0 发版。
+
+**实现落点**(均在 `CleanCDrive.ps1`):
+- `Get-FileLockers`:Add-Type 封装 rstrtmgr.dll(RmStartSession/RmRegisterResources/RmGetList/RmEndSession),目录递归采样 ≤200 文件注册会话后查询占用进程,按 PID 去重;RmGetList 首次返回 234(ERROR_MORE_DATA)属预期,按需扩大缓冲后重查;
+- `CleanBody`:删除失败时调用检测并回填 `lockedBy = [{pid, name, type}]`,`/api/status` 透传;
+- `Stop-LockingProcess` + `/api/kill` 路由:入参 id + pids,校验 pid 在该条目 lockedBy 中;系统关键进程(`$script:CriticalProcesses`)拒绝结束,explorer.exe 允许但前端确认框提示将重启桌面;
+- 前端 `lockHtml`/`isKillable`/`killLockers`:占用提示行 + 「结束进程并重试」按钮,kill 成功后自动重试清理;
+- 同版附带:分组组头全选复选框(`grpSelState`/`toggleGrpSel`/`syncGrpChk`,全选/半选 indeterminate/取消,不触发折叠)。
+
+**验证证据**:
+1. RM 单测:自进程占用/外部进程占用可检出,文件释放后零误报,进程结束后文件可删除;
+2. API 级 E2E 全链路:clean 停在 partial 且 lockedBy 含 holder(pid/进程名/type 正确)→ `/api/kill` killed=1 → 自动重试 → 目录清空、lockedBy 清空、status=done;
+3. 浏览器实测:页面渲染占用提示行("文件被占用:powershell.exe (PID …)")与「结束进程并重试」按钮正常;调用 killLockers 触发 confirm → 进程被结束 → 自动重试后条目变"已清理",无 JS 报错;分组组头全选五项交互(全选/半选/取消/不折叠/底部合计刷新)全部通过。

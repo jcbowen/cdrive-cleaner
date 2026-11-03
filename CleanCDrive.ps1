@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.4.0'
+$script:Version = '1.5.0'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
@@ -578,6 +578,121 @@ function Get-DiskUsages {
     }
     return $out
 }
+
+# 通过 Restart Manager(rstrtmgr.dll,Windows 自带)查询占用指定文件的进程,零外部依赖
+$rmCs = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public struct LockProc {
+    public int Pid;
+    public string Name;
+    public int AppType;
+}
+
+public static class CDriveRM {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RM_UNIQUE_PROCESS { public int dwProcessId; public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct RM_PROCESS_INFO {
+        public RM_UNIQUE_PROCESS Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string strServiceShortName;
+        public int ApplicationType;
+        public uint AppStatus;
+        public uint TSSessionId;
+        [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+    }
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    public static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    public static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames, uint nApplications, RM_UNIQUE_PROCESS[] rgApplications, uint nServices, string[] rgsServiceNames);
+    [DllImport("rstrtmgr.dll")]
+    public static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo, [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+    [DllImport("rstrtmgr.dll")]
+    public static extern int RmEndSession(uint pSessionHandle);
+
+    // 查询占用文件的进程列表(ApplicationType: 0 未知/1 主窗口/3 服务/4 资源管理器/1000 系统关键)
+    public static List<LockProc> Query(string[] files) {
+        var result = new List<LockProc>();
+        uint handle;
+        if (RmStartSession(out handle, 0, Guid.NewGuid().ToString()) != 0) { return result; }
+        try {
+            if (RmRegisterResources(handle, (uint)files.Length, files, 0, null, 0, null) != 0) { return result; }
+            uint needed = 0, count = 0, reasons = 0;
+            // 首次探测:expected 返回 234(ERROR_MORE_DATA),needed 为真实进程数
+            int rc = RmGetList(handle, out needed, ref count, null, ref reasons);
+            if (rc != 0 && rc != 234) { return result; }
+            if (needed == 0) { return result; }
+            var infos = new RM_PROCESS_INFO[needed];
+            count = needed;
+            if (RmGetList(handle, out needed, ref count, infos, ref reasons) != 0) { return result; }
+            for (int i = 0; i < count; i++) {
+                result.Add(new LockProc {
+                    Pid = (int)infos[i].Process.dwProcessId,
+                    Name = infos[i].strAppName,
+                    AppType = (int)infos[i].ApplicationType
+                });
+            }
+        } finally { RmEndSession(handle); }
+        return result;
+    }
+}
+"@
+
+<#
+.SYNOPSIS
+    查询占用指定路径的进程列表(Restart Manager)
+.DESCRIPTION
+    目录先递归采样最多 200 个文件路径注册到 RM 会话再查询,避免大目录全量注册拖慢速度。
+    返回值:hashtable 数组 @{ pid=进程ID; name=进程名(优先取进程映像名,兜底 RM 描述名); type=应用类型 }
+    应用类型 type:0 未知 / 1 主窗口 / 3 服务 / 4 资源管理器 / 1000 系统关键进程
+.EXAMPLE
+    Get-FileLockers -Paths @('C:\Some\Dir')
+#>
+function Get-FileLockers {
+    param([string[]]$Paths)
+    if (-not ('CDriveRM' -as [type])) { Add-Type -TypeDefinition $rmCs }
+    $files = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $Paths) {
+        if ([string]::IsNullOrWhiteSpace($p) -or $files.Count -ge 200) { continue }
+        $item = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        if (-not $item.PSIsContainer) { $files.Add($item.FullName); continue }
+        $stack = New-Object System.Collections.Generic.Stack[string]
+        $stack.Push($item.FullName)
+        while ($stack.Count -gt 0 -and $files.Count -lt 200) {
+            $dir = $stack.Pop()
+            try {
+                foreach ($f in [System.IO.Directory]::EnumerateFiles($dir)) {
+                    $files.Add($f)
+                    if ($files.Count -ge 200) { break }
+                }
+                if ($files.Count -ge 200) { break }
+                foreach ($d in [System.IO.Directory]::EnumerateDirectories($dir)) {
+                    try {
+                        $di = New-Object System.IO.DirectoryInfo($d)
+                        if (($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push($d) }
+                    } catch { }
+                }
+            } catch { }
+        }
+    }
+    if ($files.Count -eq 0) { return @() }
+    $out = @()
+    $seen = @{}
+    foreach ($l in [CDriveRM]::Query($files.ToArray())) {
+        if ($seen.ContainsKey($l.Pid)) { continue }
+        $seen[$l.Pid] = $true
+        $proc = Get-Process -Id $l.Pid -ErrorAction SilentlyContinue
+        $nm = if ($proc) { "$($proc.ProcessName).exe" } else { [string]$l.Name }
+        $out += @{ pid = [int]$l.Pid; name = $nm; type = [int]$l.AppType }
+    }
+    return $out
+}
 '@
 
 #endregion
@@ -623,6 +738,7 @@ $script:ScanBody = {
             files       = $files
             status      = ''
             message     = ''
+            lockedBy    = @()
         }
         $list.Add($obj)
         $sync.Done++
@@ -835,6 +951,14 @@ public static class CDriveShell {
         $releasedTotal += $released
         $t.size = $after
 
+        # 删除失败时用 Restart Manager 查占用进程,回填 lockedBy 供前端展示与「结束并重试」
+        # (recyclebin 无 reals、registryKey 已置空 reals,天然不参与检测)
+        $lockers = @()
+        if ($failed -gt 0 -and @($reals).Count -gt 0) {
+            try { $lockers = @(Get-FileLockers -Paths $reals) } catch { $lockers = @() }
+        }
+        $t.lockedBy = $lockers
+
         if ($t.action -eq 'registryKey') {
             if ($regDeleted -gt 0 -and $failed -eq 0) { $t.status = 'done';    $t.message = "已删除 $regDeleted 个失效注册表项" }
             elseif ($regDeleted -gt 0)                { $t.status = 'partial'; $t.message = "已删除 $regDeleted 个,其余需要管理员权限" }
@@ -845,15 +969,16 @@ public static class CDriveShell {
             else               { $t.status = 'done';    $t.message = "已清空回收站，释放 $(Format-Bytes -Bytes $released)" }
         }
         elseif ($t.action -eq 'toRecycle') {
-            if ($failed -gt 0 -and $after -gt 0) { $t.status = 'partial'; $t.message = "已移入回收站 $(Format-Bytes -Bytes $released)，部分文件被占用($lastErr)" }
-            elseif ($failed -gt 0)               { $t.status = 'partial'; $t.message = "移入回收站失败($lastErr)" }
+            if ($failed -gt 0 -and $after -gt 0) { $t.status = 'partial'; $t.message = "已移入回收站 $(Format-Bytes -Bytes $released)，部分文件被其他程序占用" }
+            elseif ($failed -gt 0)               { $t.status = 'partial'; $t.message = '移入回收站失败：文件被其他程序占用' }
             else                                 { $t.status = 'done';    $t.message = "已移入回收站 $(Format-Bytes -Bytes $released)，误删可恢复" }
         }
         elseif ($failed -gt 0 -and $after -gt 0) {
             $t.status = 'partial'; $t.message = "已释放 $(Format-Bytes -Bytes $released)，部分文件被占用跳过"
         }
         elseif ($failed -gt 0) {
-            $t.status = 'partial'; $t.message = "文件被占用，未能释放(建议关闭相关程序或以管理员运行)"
+            if ($lockers.Count -gt 0) { $t.status = 'partial'; $t.message = '文件被其他程序占用，未能释放' }
+            else                      { $t.status = 'partial'; $t.message = '文件被占用，未能释放(建议关闭相关程序或以管理员运行)' }
         }
         else {
             $t.status = 'done'; $t.message = "已释放 $(Format-Bytes -Bytes $released)"
@@ -971,12 +1096,17 @@ main{padding:8px 28px 20px}
 .desc{font-size:12px;color:var(--tx2);opacity:.85;margin-top:2px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .msg{font-size:11.5px;margin-top:2px}
 .m-done{color:var(--green)} .m-partial{color:var(--orange)} .m-error{color:var(--red)}
+.lockline{font-size:11.5px;color:var(--red);margin-top:3px}
+.lockline .locktip{color:var(--tx2);margin-left:4px}
+.btnkill{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.35);color:var(--red);margin-left:2px}
+.btnkill:hover{color:#fff;background:var(--red);border-color:var(--red)}
 .warnline{font-size:11.5px;color:var(--orange);margin-top:2px}
 .grp{margin-top:12px}
 .grp-h{display:flex;align-items:center;gap:8px;padding:9px 12px;background:var(--card);border:1px solid var(--line);border-radius:9px;font-size:13px;font-weight:600;cursor:pointer;user-select:none}
 .grp-h:hover{border-color:#64748b}
 .grp-h .arr{display:inline-block;font-size:11px;color:var(--tx2);transition:transform .2s}
 .grp-h .meta{font-weight:400;font-size:12px;color:var(--tx2)}
+.grp-h input{width:15px;height:15px;accent-color:var(--acc);cursor:pointer}
 .grp.closed .grp-b{display:none}
 .grp.closed .arr{transform:rotate(-90deg)}
 .grp-b .row:first-child{border-top:none}
@@ -1126,17 +1256,45 @@ function render(){
   var mx = 0;
   vis.forEach(function(t){ if (t.size > mx) mx = t.size; });
   var html = '<div class="thead"><div></div><div>名称</div><div>大小</div><div>文件数</div><div>路径与用途</div><div>操作</div></div>';
-  groupCats(vis).forEach(function(g){
+  var groups = groupCats(vis);
+  groups.forEach(function(g){
     var open = grpOpen[g.key] !== false;
     html += '<div class="grp' + (open ? '' : ' closed') + '">'
-      + '<div class="grp-h" onclick="tgGrp(\'' + g.key + '\')"><span class="arr">▾</span>' + g.label
+      + '<div class="grp-h" onclick="tgGrp(\'' + g.key + '\')">'
+      + '<input type="checkbox" data-key="' + g.key + '" onclick="event.stopPropagation()" onchange="toggleGrpSel(\'' + g.key + '\', this.checked)">'
+      + '<span class="arr">▾</span>' + g.label
       + '<span class="meta">' + g.items.length + ' 项 · 合计 ' + fmt(g.total) + '</span></div>'
       + '<div class="grp-b">';
     g.items.forEach(function(t){ html += rowHtml(t, mx); });
     html += '</div></div>';
   });
   main.innerHTML = html;
+  syncGrpChk();
   updateSel();
+}
+
+// 组全选状态:0=无选中 1=全选 2=部分选中(半选)
+function grpSelState(items){
+  var n = 0;
+  items.forEach(function(t){ if (sel[t.id]) n++; });
+  return n === 0 ? 0 : (n === items.length ? 1 : 2);
+}
+// 勾选/取消整组:onclick 已 stopPropagation,不会触发组头折叠
+function toggleGrpSel(key, on){
+  var g = groupCats(visibleRows()).filter(function(x){ return x.key === key; })[0];
+  if (!g) return;
+  g.items.forEach(function(t){ sel[t.id] = on; });
+  render();
+}
+// 按当前勾选情况同步组头复选框的勾选/半选状态(轮询重渲染与行级勾选后调用)
+function syncGrpChk(){
+  groupCats(visibleRows()).forEach(function(g){
+    var cb = document.querySelector('.grp-h input[data-key="' + g.key + '"]');
+    if (!cb) return;
+    var s = grpSelState(g.items);
+    cb.checked = s === 1;
+    cb.indeterminate = s === 2;
+  });
 }
 
 // 结果分类定义与分组:固定组顺序,组内按大小降序、同名按名称排序;无 cat 的旧数据归入常规缓存
@@ -1163,6 +1321,27 @@ function groupCats(vis){
 }
 function tgGrp(key){ grpOpen[key] = grpOpen[key] === false; render(); }
 
+// 系统关键进程(与后端 CriticalProcesses 一致),type=1000 为 Restart Manager 标记的系统关键进程
+var CRIT_PROCS = ['system','smss','csrss','wininit','winlogon','services','lsass','svchost','dwm','fontdrvhost','registry','memory compression'];
+function isKillable(l){
+  return l.type !== 1000 && CRIT_PROCS.indexOf((l.name || '').replace(/\.exe$/i, '').toLowerCase()) < 0;
+}
+// 占用提示行:显示占用进程名/PID,存在可结束进程时提供「结束进程并重试」按钮(清理进行中隐藏)
+function lockHtml(t){
+  if (!t.lockedBy || !t.lockedBy.length) return '';
+  var names = t.lockedBy.map(function(l){ return esc(l.name) + ' (PID ' + l.pid + ')'; }).join('、');
+  var ks = t.lockedBy.filter(function(l){ return isKillable(l); });
+  var btn = '';
+  var tip = '';
+  if (ks.length && st.clean.state !== 'running') {
+    var hasExp = t.lockedBy.some(function(l){ return l.type === 4 || l.name.toLowerCase() === 'explorer.exe'; });
+    tip = hasExp ? '（结束资源管理器会短暂重启桌面）' : '';
+    btn = ' <button class="mini btnkill" onclick="killLockers(\'' + t.id + '\')">结束进程并重试</button>';
+  }
+  var note = ks.length ? '' : '，均为系统关键进程，无法自动结束';
+  return '<div class="lockline">文件被占用：' + names + note + '<span class="locktip">' + tip + '</span>' + btn + '</div>';
+}
+
 function rowHtml(t, mx){
   var rb = t.risk === 'caution' ? '<span class="badge b-caution">谨慎</span>'
          : t.risk === 'admin' ? '<span class="badge b-admin">需管理员</span>'
@@ -1183,6 +1362,7 @@ function rowHtml(t, mx){
     + '<div class="desc" title="' + esc(t.description) + '">' + esc(t.description) + '</div>'
     + (t.risk === 'admin' && !st.isadmin ? '<div class="warnline">当前未以管理员身份运行，清理可能不完整</div>' : '')
     + (t.message ? '<div class="msg m-' + t.status + '">' + esc(t.message) + '</div>' : '')
+    + lockHtml(t)
     + '</div>'
     + '<div><button class="mini" ' + (canopen ? '' : 'disabled') + ' onclick="openDir(\'' + t.id + '\')">打开</button></div>'
     + '</div>';
@@ -1198,6 +1378,7 @@ function updateSel(){
   visibleRows().forEach(function(t){ if (sel[t.id]) { n++; s += t.size; } });
   document.getElementById('selc').textContent = n;
   document.getElementById('selsz').textContent = fmt(s);
+  syncGrpChk();
 }
 function toggleSel(id, on){ sel[id] = on; updateSel(); }
 function selSafe(){ visibleRows().forEach(function(t){ if (t.risk === 'safe') sel[t.id] = true; }); render(); }
@@ -1226,6 +1407,19 @@ function addDir(){
 }
 function rescan(){ api('/api/rescan', {}).then(function(){ toast('重新扫描已开始'); }); }
 function openDir(id){ api('/api/open', {id: id}).then(function(r){ if (!r.ok) toast(r.error || '打开失败'); }); }
+// 结束占用进程并重试清理:仅提交可结束的进程,后端二次校验 PID 白名单与关键进程保护
+function killLockers(id){
+  var t = st.results.filter(function(x){ return x.id === id; })[0];
+  if (!t || !t.lockedBy || !t.lockedBy.length) return;
+  var pids = t.lockedBy.filter(function(l){ return isKillable(l); }).map(function(l){ return l.pid; });
+  if (!pids.length) { toast('占用进程均为系统关键进程，无法结束'); return; }
+  var hasExp = t.lockedBy.some(function(l){ return l.type === 4 || l.name.toLowerCase() === 'explorer.exe'; });
+  if (!confirm('将结束 ' + pids.length + ' 个占用进程并重新清理' + (hasExp ? '（包含资源管理器，桌面会短暂重启）' : '') + '，继续吗？')) return;
+  api('/api/kill', {id: id, pids: pids}).then(function(r){
+    if (r.ok) toast('已结束占用进程，正在重新清理…');
+    else toast(r.error || '结束进程失败');
+  });
+}
 function stopSrv(){
   if (!confirm('确定退出清理助手吗？')) return;
   st.exiting = true;
@@ -1578,10 +1772,58 @@ function Open-TargetFolder {
 
 <#
 .SYNOPSIS
+    结束占用进程并自动重试清理
+.DESCRIPTION
+    校验待结束 PID 确实在目标条目的 lockedBy 占用列表中(防止滥用),系统关键进程拒绝结束;
+    至少结束一个进程时自动以该条目 id 触发一次重新清理(等效重试)。
+    入参(body JSON):id=目标条目 id;pids=要结束的进程 PID 数组(或 pid=单个 PID)。
+    返回值:@{ok=$true; killed=N} 成功;@{ok=$false; error=...} 全部失败
+.EXAMPLE
+    Stop-LockingProcess -Body $ctx
+#>
+function Stop-LockingProcess {
+    param($Body)
+    $body = Read-JsonBody -Ctx $Body
+    $id = [string]$body.id
+    $t = @($script:Sync.Results) | Where-Object { $_.id -eq $id } | Select-Object -First 1
+    if (-not $t) { return @{ ok = $false; error = '未找到该清理项' } }
+
+    $known = @()
+    if ($t.lockedBy) { $known = @($t.lockedBy) }
+    $pids = @()
+    if ($body.pids) { $pids = @($body.pids | ForEach-Object { [int]$_ }) }
+    elseif ($body.pid) { $pids = @([int]$body.pid) }
+    if (-not $pids.Count) { return @{ ok = $false; error = '未指定要结束的进程' } }
+
+    $killed = 0
+    $errors = @()
+    foreach ($p in $pids) {
+        $lock = $known | Where-Object { [int]$_.pid -eq $p } | Select-Object -First 1
+        if (-not $lock) { $errors += "PID $p 不在该项目的占用列表中"; continue }
+        $nm = ([string]$lock.name) -replace '\.exe$', ''
+        if ([int]$lock.type -eq 1000 -or $script:CriticalProcesses -contains $nm) {
+            $errors += "$($lock.name) 为系统关键进程，不能结束"
+            continue
+        }
+        try { Stop-Process -Id $p -Force -ErrorAction Stop; $killed++ } catch { $errors += "结束 $($lock.name) 失败：$($_.Exception.Message)" }
+    }
+    if ($killed -gt 0) {
+        # 结束成功后自动重试清理该条目(清理进行中则跳过,等用户手动再清)
+        if ($script:Sync.Clean.state -ne 'running') {
+            [void](Start-Clean -Ids @($id) -Sync $script:Sync)
+        }
+    }
+    if ($killed -gt 0 -and -not $errors.Count) { return @{ ok = $true; killed = $killed } }
+    if ($killed -gt 0) { return @{ ok = $true; killed = $killed; error = ($errors -join '；') } }
+    return @{ ok = $false; error = ($errors -join '；') }
+}
+
+<#
+.SYNOPSIS
     分发处理单个 HTTP 请求
 .DESCRIPTION
     路由:GET / 返回页面;GET /api/status 返回状态;POST /api/clean、/api/open、
-    /api/add、/api/rescan、/api/stop 执行对应动作。异常统一返回 500 JSON。
+    /api/add、/api/rescan、/api/stop、/api/kill 执行对应动作。异常统一返回 500 JSON。
 .PARAMETER Ctx
     HttpListenerContext 上下文对象
 .EXAMPLE
@@ -1620,6 +1862,10 @@ function Invoke-RequestHandler {
         }
         if ($route -eq '/api/check-update' -and $Ctx.Request.HttpMethod -eq 'POST') {
             Send-Json -Ctx $Ctx (Start-ManualCheck)
+            return
+        }
+        if ($route -eq '/api/kill' -and $Ctx.Request.HttpMethod -eq 'POST') {
+            Send-Json -Ctx $Ctx (Stop-LockingProcess -Body $Ctx)
             return
         }
         if ($route -eq '/api/open' -and $Ctx.Request.HttpMethod -eq 'POST') {
@@ -1673,6 +1919,9 @@ $script:Sync.Update       = @{ available = $false; phase = 'idle'; error = ''; c
 $script:Sync.StopRequested = $false
 $script:StopRequested    = $false
 $script:Port             = $StartPort
+
+# 系统关键进程清单(结束会危及系统稳定,/api/kill 一律拒绝)
+$script:CriticalProcesses = @('system', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass', 'svchost', 'dwm', 'fontdrvhost', 'registry', 'memory compression')
 
 # 启动入口自愈:校验/修复 start.bat(内容随主脚本分发,详见 Repair-StartBat)
 Repair-StartBat
