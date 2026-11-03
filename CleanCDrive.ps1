@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.3.0'
+$script:Version = '1.4.0'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
@@ -331,7 +331,9 @@ function Get-UninstallExePath {
     检测卸载残留:孤儿卸载注册表项与遗留数据目录
 .DESCRIPTION
     1) 枚举 HKLM/HKCU Uninstall 键:UninstallString 指向的 .exe/.msi 不存在,或 InstallLocation 非空且目录不存在 → 孤儿项(HKCU=caution,HKLM=admin,action=registryKey,regKeys 供清理删键);
-    2) 扫描 %APPDATA%/%LOCALAPPDATA%/%ProgramData% 顶层目录:规范化名称与已安装软件名/发布商名比对(相等或前缀互含视为匹配),匹配不到且不在内置排除清单 → 疑似残留(caution,action=toRecycle 移入回收站);
+    2) 扫描 %APPDATA%/%LOCALAPPDATA%/%ProgramData% 顶层目录,四重防误报过滤(依次):
+       内置排除清单 → 名称匹配已安装软件/发布商 → 目录名匹配真实安装路径证据(InstallLocation/DisplayIcon/UninstallString 解析) → 目录内文件活跃度(90 天内有写入)或含卸载器(unins*.exe)视为在用;
+       全部不命中 → 疑似残留(caution,action=toRecycle 移入回收站);
     3) 总数上限 80,名称无法规范化或解析失败的保守跳过。
     返回值：目标数组,无残留时返回 @()
 .EXAMPLE
@@ -347,7 +349,8 @@ function Get-UninstallResidueTargets {
         @{ hive = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'; tag = 'hklm32'; admin = $true  },
         @{ hive = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall';             tag = 'hkcu';  admin = $false }
     )
-    $nameNorms = New-Object System.Collections.Generic.List[string]
+    $nameNorms    = New-Object System.Collections.Generic.List[string]
+    $pathDirNorms = New-Object System.Collections.Generic.List[string]
     $orphans   = @()
 
     foreach ($r in $roots) {
@@ -357,6 +360,26 @@ function Get-UninstallResidueTargets {
             if (-not $p.DisplayName) { continue }
             $nameNorms.Add((Get-NormName -Name ([string]$p.DisplayName)))
             if ($p.Publisher) { $nameNorms.Add((Get-NormName -Name ([string]$p.Publisher))) }
+
+            # 路径证据:从 InstallLocation/DisplayIcon/UninstallString 提取真实安装目录名加入比对集合,
+            # 残留候选目录名与真实安装路径吻合时视为在用(防误报第二道防线)
+            foreach ($src in @([string]$p.InstallLocation, [string]$p.DisplayIcon, [string]$p.UninstallString)) {
+                if (-not $src) { continue }
+                $s = $src.Trim('"')
+                $s = ($s -split ' -')[0].Trim()
+                $s = ($s -split ',')[0].Trim()   # DisplayIcon 可能带图标索引后缀(如 app.exe,0)
+                if ($s -match '\.(exe|ico|msi|dll)$') { $s = Split-Path -Parent $s }
+                if ($s -match '^[A-Za-z]:\\') {
+                    $isDir = $false
+                    try { $isDir = Test-Path -LiteralPath $s -PathType Container } catch { }   # 脏值(非法字符)保守忽略
+                    if ($isDir) {
+                        $pn = Get-NormName -Name (Split-Path -Leaf $s)
+                        if ($pn) { $pathDirNorms.Add($pn) }
+                        $pp = Split-Path -Parent $s
+                        if ($pp) { $ppn = Get-NormName -Name (Split-Path -Leaf $pp); if ($ppn) { $pathDirNorms.Add($ppn) } }
+                    }
+                }
+            }
 
             $exe = Get-UninstallExePath -UninstallString ([string]$p.UninstallString)
             $loc = ([string]$p.InstallLocation).Trim()
@@ -392,7 +415,16 @@ function Get-UninstallResidueTargets {
         'kingsoft','wps','qihoo','360safe','steam','epic','vmware','programs','packages','temp','tmp','squirreltemp',
         'crashdumps','d3dscache','comms','connecteddevicesplatform','crypto','virtualstore','iconcache','cache',
         'logs','pip','npm','npmcache','yarn','pnpm','nuget','gocache','gobuild','code','vscode','electron',
-        'updater','webview','cef','cefsharp','mssdk','lenovo','appleinc','applecomputer','visualstudiosetup'
+        'updater','webview','cef','cefsharp','mssdk','lenovo','appleinc','applecomputer','visualstudiosetup',
+        # Windows/系统组件目录
+        'usoprivate','usoshared','softwaredistribution','systemrestore','ssh','speech','peerdistrepub',
+        'packagemanagement','packagecache','microsofthelp','oemlinks','publishers','placeholdertilelogofolder',
+        'toastnotificationmanagercompat','elevateddiagnostics','install','pchealthcheck',
+        # 开发工具链目录
+        'node','gopls','goimports','golangcirlint','staticcheck','msplaywright','playwright','rod','uv',
+        'pnpmcache','pnpmstate','buf','fyne','jsv8flags','fontconfig',
+        # 其他已知厂商/组件
+        'xwalk','canonbj','logishrd','riotgames','safenetsentinel','audysseylabs','anticheatexpert','cleantrash'
     )
     foreach ($rootEnv in @($env:APPDATA, $env:LOCALAPPDATA, $env:ProgramData)) {
         if (-not $rootEnv -or -not (Test-Path -LiteralPath $rootEnv)) { continue }
@@ -402,8 +434,29 @@ function Get-UninstallResidueTargets {
             if ($dir.Name.StartsWith('.') -or $dir.Name.StartsWith('@')) { continue }   # 隐藏工具目录(如 .lingma、@xxx)保守跳过
             $dn = Get-NormName -Name $dir.Name
             if (-not $dn) { continue }                                       # 无法规范化 → 保守跳过
+            if ($dn -like 'regid*') { continue }                             # regid.* 类系统组件目录
             if ($exclude -contains $dn) { continue }                          # 排除清单
             if (Test-NameMatch -DirNorm $dn -Norms $nameNorms) { continue }   # 匹配到已安装软件/发布商
+            if (Test-NameMatch -DirNorm $dn -Norms $pathDirNorms) { continue } # 目录名与某软件真实安装路径吻合
+            # 一次遍历同时收集两项证据(仅对通过前面过滤的候选执行,控制 I/O):
+            # a) 90 天活跃度:近期仍有文件写入的目录视为在用(宁可不报);
+            # b) 卸载器证据:目录内含 unins*.exe 说明仍关联着已安装程序,不是孤儿数据
+            $files = @(Get-ChildItem -LiteralPath $dir.FullName -Recurse -Depth 2 -File -ErrorAction SilentlyContinue)
+            $newest = ($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+            $idleDays = if ($newest) { [int]((Get-Date) - $newest).TotalDays } else { 9999 }
+            if ($idleDays -lt 90) { continue }
+            if ($files | Where-Object { $_.Name -match '^unins.*\.exe$' }) { continue }
+            # c) 可执行文件厂商证据:目录内 exe 的产品名/公司名匹配已安装软件 → 在用
+            $vendorHit = $false
+            $exes = @($files | Where-Object { $_.Extension -eq '.exe' } | Select-Object -First 8)
+            foreach ($e in $exes) {
+                foreach ($v in @([string]$e.VersionInfo.ProductName, [string]$e.VersionInfo.CompanyName)) {
+                    $vn = Get-NormName -Name $v
+                    if ($vn -and (Test-NameMatch -DirNorm $vn -Norms $nameNorms)) { $vendorHit = $true; break }
+                }
+                if ($vendorHit) { break }
+            }
+            if ($vendorHit) { continue }
             $slug = ($dir.FullName -replace '[:\\]', '-').ToLower()
             $list.Add([pscustomobject]@{
                 id          = "orphan-dir-$slug"
@@ -421,11 +474,18 @@ function Get-UninstallResidueTargets {
     return $list.ToArray()
 }
 
+# 给目标对象打分类标签:hashtable 直接加键,pscustomobject 需用 Add-Member(PS5.1 不允许直接赋值新增属性)
+function Set-TargetCat { param($Target, [string]$Cat)
+    if ($Target -is [hashtable]) { $Target['cat'] = $Cat }
+    else { Add-Member -InputObject $Target -NotePropertyName cat -NotePropertyValue $Cat -Force }
+}
+
 <#
 .SYNOPSIS
-    合并内置、自定义与开发盘动态清理目标
+    合并内置、自定义与开发盘动态清理目标,并为每项打分类标签(cat)
 .DESCRIPTION
-    内置项在前、自定义项与开发盘动态项在后；按 id 去重(自定义/动态项覆盖同 id 内置项)。
+    合并顺序:内置 → 自定义 → 开发盘动态 → 卸载残留;按 id 去重(自定义/动态项覆盖同 id 内置项)。
+    cat 分类:builtin=常规缓存 / custom=自定义目录 / dev=开发产物 / orphan-dir=疑似卸载残留 / orphan-reg=失效卸载注册表项,供前端分组渲染。
     返回值：目标数组
 .EXAMPLE
     $all = Merge-Targets
@@ -436,10 +496,14 @@ function Merge-Targets {
     $dev     = Get-DevTargets
     $residue = Get-UninstallResidueTargets
     $map = @{}
-    foreach ($t in $builtin) { $map[$t.id] = $t }
-    foreach ($t in $custom)  { $map[$t.id] = $t }
-    foreach ($t in $dev)     { $map[$t.id] = $t }
-    foreach ($t in $residue) { $map[$t.id] = $t }
+    foreach ($t in $builtin) { Set-TargetCat -Target $t -Cat 'builtin'; $map[$t.id] = $t }
+    foreach ($t in $custom)  { Set-TargetCat -Target $t -Cat 'custom';  $map[$t.id] = $t }
+    foreach ($t in $dev)     { Set-TargetCat -Target $t -Cat 'dev';     $map[$t.id] = $t }
+    foreach ($t in $residue) {
+        $cat = if ($t.action -eq 'registryKey') { 'orphan-reg' } else { 'orphan-dir' }
+        Set-TargetCat -Target $t -Cat $cat
+        $map[$t.id] = $t
+    }
     return @($map.Values)
 }
 
@@ -547,6 +611,7 @@ $script:ScanBody = {
         }
         $obj = [pscustomobject]@{
             id          = $t.id
+            cat         = [string]$t.cat
             name        = $t.name
             paths       = @($t.paths)
             real        = @($reals)
@@ -907,6 +972,14 @@ main{padding:8px 28px 20px}
 .msg{font-size:11.5px;margin-top:2px}
 .m-done{color:var(--green)} .m-partial{color:var(--orange)} .m-error{color:var(--red)}
 .warnline{font-size:11.5px;color:var(--orange);margin-top:2px}
+.grp{margin-top:12px}
+.grp-h{display:flex;align-items:center;gap:8px;padding:9px 12px;background:var(--card);border:1px solid var(--line);border-radius:9px;font-size:13px;font-weight:600;cursor:pointer;user-select:none}
+.grp-h:hover{border-color:#64748b}
+.grp-h .arr{display:inline-block;font-size:11px;color:var(--tx2);transition:transform .2s}
+.grp-h .meta{font-weight:400;font-size:12px;color:var(--tx2)}
+.grp.closed .grp-b{display:none}
+.grp.closed .arr{transform:rotate(-90deg)}
+.grp-b .row:first-child{border-top:none}
 .mini{background:var(--card2);border:1px solid var(--line);color:var(--tx2);font-size:12px;padding:5px 12px;border-radius:8px;cursor:pointer;white-space:nowrap}
 .mini:hover{color:var(--tx);border-color:#64748b}
 .mini:disabled{opacity:.4;cursor:not-allowed}
@@ -1053,10 +1126,42 @@ function render(){
   var mx = 0;
   vis.forEach(function(t){ if (t.size > mx) mx = t.size; });
   var html = '<div class="thead"><div></div><div>名称</div><div>大小</div><div>文件数</div><div>路径与用途</div><div>操作</div></div>';
-  vis.forEach(function(t){ html += rowHtml(t, mx); });
+  groupCats(vis).forEach(function(g){
+    var open = grpOpen[g.key] !== false;
+    html += '<div class="grp' + (open ? '' : ' closed') + '">'
+      + '<div class="grp-h" onclick="tgGrp(\'' + g.key + '\')"><span class="arr">▾</span>' + g.label
+      + '<span class="meta">' + g.items.length + ' 项 · 合计 ' + fmt(g.total) + '</span></div>'
+      + '<div class="grp-b">';
+    g.items.forEach(function(t){ html += rowHtml(t, mx); });
+    html += '</div></div>';
+  });
   main.innerHTML = html;
   updateSel();
 }
+
+// 结果分类定义与分组:固定组顺序,组内按大小降序、同名按名称排序;无 cat 的旧数据归入常规缓存
+var grpOpen = {};   // 组折叠状态,false=折叠,未定义=展开
+function groupCats(vis){
+  var defs = [
+    {key:'builtin',    label:'常规缓存'},
+    {key:'custom',     label:'自定义目录'},
+    {key:'dev',        label:'开发产物'},
+    {key:'orphan-dir', label:'疑似卸载残留'},
+    {key:'orphan-reg', label:'失效卸载注册表项'}
+  ];
+  var buckets = {};
+  vis.forEach(function(t){
+    var k = defs.some(function(d){ return d.key === t.cat; }) ? t.cat : 'builtin';
+    (buckets[k] = buckets[k] || []).push(t);
+  });
+  return defs.filter(function(d){ return buckets[d.key] && buckets[d.key].length; }).map(function(d){
+    var items = buckets[d.key].sort(function(a, b){ return b.size - a.size || (a.name < b.name ? -1 : 1); });
+    var total = 0;
+    items.forEach(function(t){ total += t.size; });
+    return {key:d.key, label:d.label, items:items, total:total};
+  });
+}
+function tgGrp(key){ grpOpen[key] = grpOpen[key] === false; render(); }
 
 function rowHtml(t, mx){
   var rb = t.risk === 'caution' ? '<span class="badge b-caution">谨慎</span>'

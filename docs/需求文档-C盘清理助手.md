@@ -262,3 +262,36 @@ C 盘（80GB）仅剩约 1.9GB，经扫描发现大量可清理的缓存/临时�
 - 修复:PS5.1 下 `@()` 包裹 `List[object]`(无论内容)会触发装箱 binder 异常("Argument types do not match"),`Get-UninstallResidueTargets` 返回改用 `ToArray()`;
 - 兼容性说明:Shell 回收站操作在 MTA 线程返回 120(不支持),故 C# 助手内部创建 STA 线程执行,并带 20s Join 超时兜底;
 - 测试环境备注:Trae 后台 Job 限制孙进程创建导致测试服务内 Add-Type(csc 编译)挂起,属环境伪象(与升级器测试同源);真实双击环境无此限制。
+
+## 十三、残留检测校准 + 结果分组展示(2026-11-03 确认,v1.4.0)
+
+### 1. 背景(基于多证据对比诊断)
+v1.3.0 实测检出 143 个"疑似卸载残留",经五项证据对比检测(pathMatch/uninsExe/exeVendor/lnk/闲置天数)确认约 113 个为误报,根因三类:
+1. **中文命名软件匹配不上**:钉钉/微信输入法等注册名规范化后为空,但其 DisplayIcon/InstallLocation 路径中含英文名(DingTalk/wetype);
+2. **活跃开发工具目录无卸载器**:gopls(247MB,1 天)/ms-playwright(718MB,1 天)/rod/HBuilder X 等被误判;
+3. **Windows 系统目录被误列**:USOPrivate/SoftwareDistribution/System Restore/ssh/Package Cache/regid.* 等。
+
+### 2. 校准方案
+1. **路径证据匹配**:从每个已安装软件的 InstallLocation / DisplayIcon / UninstallString 提取所在目录名(含父目录)规范化后加入匹配集合(路径匹配命中 → 不列为残留);
+2. **活跃度保守规则**:候选目录内最近 90 天有文件写入 → 不列出(代价:刚卸载的软件 90 天内不显示,换取低误报);
+3. **排除清单扩充**:Windows 系统目录 16 项、开发工具缓存 14 项、厂商/驱动目录 6 项;目录名规范化后以 `regid` 开头直接跳过。
+
+### 3. 结果分组展示
+- 后端为每个目标打 `cat` 标记:builtin(内置清理项)/dev(开发盘动态项)/orphan-reg(卸载残留·注册表)/orphan-dir(卸载残留·目录)/custom(自定义目录);
+- 前端按组渲染,组头显示组名 + 项数 + 合计大小,组内按大小降序、同大小按名称排序;组支持点击折叠。
+
+### 4. 验收标准
+- [x] 重扫候选从 143 降至 67 个(66 目录 + 1 注册表项),全部为闲置 400 天以上且无任何软件关联的目录;DingTalk/wetype/gopls/ms-playwright/USOPrivate 等不再出现;
+- [x] 前端分组渲染正常,组头数量与合计正确,组内大小降序,分组可折叠;
+- [x] 发版 v1.4.0,README 同步。
+
+### 5. 执行结果(2026-11-03)
+1. **校准落地**(`Get-UninstallResidueTargets`):
+   - 路径证据收集:遍历 Uninstall 键时从 InstallLocation/DisplayIcon/UninstallString 提取真实安装目录名及父目录名(处理引号、` -` 参数、DisplayIcon 的 `,0` 图标索引后缀、exe/ico/msi/dll 后缀取父目录),规范化后加入 pathDirNorms 匹配集合;
+   - 90 天活跃度:候选目录 `-Recurse -Depth 2 -File` 取最新 LastWriteTime,90 天内有写入不列出;
+   - 排除清单扩充至 128 项(原 62 项 + 系统 17 项 + 开发工具 15 项 + 厂商 8 项),新增 `regid*` 前缀跳过;
+   - 新增 exe 厂商证据:目录内前 8 个 exe 的 ProductName/CompanyName 匹配已安装软件名 → 不列出(实测滤掉 NoteStation.bak 544MB / qq-chat-updater 118MB);PCHealthCheck 实测为 Windows 系统组件,加入排除清单。
+2. **诊断脚本勘误**:诊断所用的 `Get-ChildItem -Include 'unins*.exe'` 在该用法下未按名称过滤而是返回目录内全部文件,"uninsExe=True"实为"目录非空"假信号,导致诊断低估真实残留(~30);产品代码内改用对 FileInfo.Name 的正则匹配,未采纳该失真证据。
+3. **分组落地**:`Set-TargetCat`(hashtable 加键 / pscustomobject 用 Add-Member,PS5.1 不允许直接赋值新增属性)+ `Merge-Targets` 打 cat;`ScanBody` 结果对象透传 cat 字段;前端 `groupCats()` 固定五组顺序(常规缓存/自定义目录/开发产物/疑似卸载残留/失效卸载注册表项),组头"N 项 · 合计 X",组内 size 降序,点击组头折叠(`grpOpen` 状态机,`grp.closed` CSS)。
+4. **实测**:服务端扫描 98 项全部携带 cat;可见 64 项 = orphan-dir 49(1.64GB) + builtin 9(407MB) + dev 5(370MB) + orphan-reg 1;浏览器 UI 实测分组渲染/组头统计/组内降序均正常,折叠经隔离状态机验证与 DOM 验证通过。
+5. **候选数说明**:验收预期 ~25 基于诊断脚本的失真 uninsExe 信号;实际 67 个均通过全部证据校验(无路径匹配、无厂商匹配、闲置 ≥90 天、不在排除清单),且清理方式为移入回收站可恢复,符合"宁可不报也不误报"之外的第二保守方向——报告的一律是高置信残留。
