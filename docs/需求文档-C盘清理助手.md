@@ -224,3 +224,41 @@ C 盘（80GB）仅剩约 1.9GB，经扫描发现大量可清理的缓存/临时�
 - [x] 动态项全链路实测:D 盘测试夹具 node_modules 被发现(dev-node_modules-* id)→ 勾选清理 → status=done、释放量正确、目录清空、磁盘用量刷新;
 - [x] 浏览器 UI 实测:C/D 双环形图正常渲染、动态项带"谨慎"徽章且默认不勾选、页脚 v1.2.0、控制台无 JS 错误;
 - 备注:沙箱测试中夹具首测报"文件被占用"为沙箱对非白名单目录删除限制的环境伪象(手动 Remove-Item 同样被拒),沙箱可写目录内夹具全链路验证通过;真实环境无此限制。
+
+## 十二、卸载残留检测(2026-11-03 确认,v1.3.0)
+
+### 1. 背景与目标
+软件卸载后常留下两类残留:卸载列表中已指向不存在文件的**孤儿注册表项**,以及不在任何已安装软件匹配范围内的**遗留数据目录**(%APPDATA% / %LOCALAPPDATA% / %ProgramData% 顶层)。本需求提供检测与清理能力,全部为默认不勾选的疑似项,由用户逐项确认。
+
+### 2. 孤儿注册表项
+- 枚举 `HKLM\SOFTWARE\...Uninstall`、`HKLM\SOFTWARE\WOW6432Node\...Uninstall`、`HKCU\Software\...Uninstall` 下含 DisplayName 的项;
+- 判定孤儿:UninstallString 解析出的 .exe/.msi 路径不存在,或 InstallLocation 非空且目录不存在(解析器兼容带引号/带参数的字符串,仅绝对路径参与判定);
+- HKCU 项 risk=caution(可直接删),HKLM 项 risk=admin(无管理员权限时仅提示,现有 admin 徽章机制复用);
+- 清理动作:删除对应注册表键,结果按"已删除 N 个失效注册表项"反馈。
+
+### 3. 残留数据目录
+- 扫描 %APPDATA%、%LOCALAPPDATA%、%ProgramData% 三个位置的**顶层**目录;
+- 匹配:目录名规范化(小写、去版本号与分隔符)后与已安装软件名/发布商名比对(相等或前缀互含视为匹配);匹配不到 → 疑似残留;
+- 防误报:内置排除清单(厂商根目录与系统通用目录,如 Microsoft/Google/Programs/Packages/Temp/pip/npm-cache 等),命中绝不列出;名称无法规范化的保守跳过;
+- risk=caution 默认不勾选,清理动作=**移入回收站**(可恢复,更安全)。
+
+### 4. 实现要点
+- 新增 action 类型:`toRecycle`(VisualBasic FileSystem.DeleteDirectory SendToRecycleBin)、`registryKey`(Remove-Item 删除注册表键,ScanBody 中不做文件展开、size 恒为 0);
+- 前端 visibleRows 对 size=0 的 registryKey 项放行,保证可见;
+- 数量上限 80 项,防止异常环境拖慢扫描。
+
+### 5. 验收标准
+- [x] 伪造孤儿注册表项(HKCU)与残留目录被正确检出并显示"谨慎/需管理员"徽章;
+- [x] 残留目录清理后进回收站可恢复;孤儿注册表项清理后注册表键消失;
+- [x] 排除清单内目录(Microsoft/Programs/pip 等)绝不误报;已安装软件对应目录不误报;
+- [x] 发版 v1.3.0,README 同步。
+
+### 6. 执行结果(2026-11-03 完成)
+
+- [x] 主脚本:新增 Get-NormName / Test-NameMatch / Get-UninstallExePath / Get-UninstallResidueTargets(并入 Merge-Targets);新增 action `toRecycle`(C# 助手 CDriveShell 在 STA 线程执行 SHFileOperation 移入回收站)与 `registryKey`(删注册表键);前端 visibleRows 放行 size=0 的 registryKey 项;版本号升至 1.3.0;
+- [x] 孤儿注册表项实测:伪造 HKCU 项(指向不存在卸载程序)被检出并端到端删除(已删除 1 个失效注册表项,键消失);真实环境检出微信(HKLM32,卸载程序已不存在)与 Intel ME 等失效项,HKLM 项带"需管理员"徽章;
+- [x] 残留目录实测:伪造 APPDATA 目录被检出;排除清单精确检查通过(Microsoft/Programs/pip 等绝不误报);真实环境检出 DingTalk 历史版本、Postman、ApiPost 等数十个历史残留目录;目录进回收站在非 Job 受限环境端到端验证通过(移入回收站可在回收站中找到并恢复);
+- [x] 浏览器 UI 实测:size=0 的失效卸载项正常显示、谨慎/需管理员徽章正确、v1.3.0、控制台无 JS 错误;
+- 修复:PS5.1 下 `@()` 包裹 `List[object]`(无论内容)会触发装箱 binder 异常("Argument types do not match"),`Get-UninstallResidueTargets` 返回改用 `ToArray()`;
+- 兼容性说明:Shell 回收站操作在 MTA 线程返回 120(不支持),故 C# 助手内部创建 STA 线程执行,并带 20s Join 超时兜底;
+- 测试环境备注:Trae 后台 Job 限制孙进程创建导致测试服务内 Add-Type(csc 编译)挂起,属环境伪象(与升级器测试同源);真实双击环境无此限制。

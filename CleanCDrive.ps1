@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.2.0'
+$script:Version = '1.3.0'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
@@ -92,7 +92,8 @@ function Repair-StartBat {
     获取内置的清理目标清单
 .DESCRIPTION
     每个目标包含 id、name、paths(支持通配符)、description、risk、action 字段。
-    action: deleteContents=删除目录内容(保留目录本身)；recyclebin=清空回收站
+    action: deleteContents=删除目录内容(保留目录本身)；recyclebin=清空回收站；
+            toRecycle=目录移入回收站(可恢复)；registryKey=删除注册表键(regKeys 字段)
     risk  : safe=安全；caution=谨慎；admin=需要管理员权限
 .PARAMETER  无
 .EXAMPLE
@@ -268,6 +269,160 @@ function Get-DevTargets {
 
 <#
 .SYNOPSIS
+    规范化软件/目录名称用于比对
+.DESCRIPTION
+    小写、去版本号、仅保留字母/数字/加号；中文名等无法规范化的返回空串(调用方保守跳过)。
+    返回值：规范化字符串(可能为空)
+.EXAMPLE
+    $n = Get-NormName -Name '7-Zip 24.08'   # 'zip' -> 实际 'zip' 前置 7 保留 → '7zip'
+#>
+function Get-NormName {
+    param([string]$Name)
+    $s = $Name.ToLower()
+    $s = $s -replace '\d+(\.\d+)+', ''   # 去版本号
+    $s = $s -replace '[^a-z0-9+]', ''    # 仅保留字母/数字/加号
+    return $s
+}
+
+<#
+.SYNOPSIS
+    判断目录名是否匹配已安装软件名/发布商名集合
+.DESCRIPTION
+    相等或前缀互含视为匹配(保守方向:宁可不报也不误报)。
+    返回值：$true=匹配(非残留)
+.EXAMPLE
+    Test-NameMatch -DirNorm 'google' -Norms (@('googlechrome','googlellc') -as [System.Collections.Generic.List[string]])
+#>
+function Test-NameMatch {
+    param([string]$DirNorm, [System.Collections.Generic.List[string]]$Norms)
+    foreach ($n in $Norms) {
+        if (-not $n) { continue }
+        if ($n -eq $DirNorm -or $n.StartsWith($DirNorm) -or $DirNorm.StartsWith($n)) { return $true }
+    }
+    return $false
+}
+
+<#
+.SYNOPSIS
+    从 UninstallString 解析出卸载程序路径
+.DESCRIPTION
+    兼容带引号/带参数/带 msiexec 调用形式；仅接受绝对盘符路径，解析失败返回空串。
+    返回值：路径字符串或 ''
+.EXAMPLE
+    Get-UninstallExePath -UninstallString '"C:\Program Files\App\unins000.exe" /S'
+#>
+function Get-UninstallExePath {
+    param([string]$UninstallString)
+    $s = $UninstallString.Trim()
+    if (-not $s) { return '' }
+    if ($s.StartsWith('"')) {
+        $end = $s.IndexOf('"', 1)
+        if ($end -gt 1) { $s = $s.Substring(1, $end - 1) } else { return '' }
+    } else {
+        $m = [regex]::Match($s, '^(.+?\.(?i:exe|msi|msp))')
+        if ($m.Success) { $s = $m.Groups[1].Value } else { return '' }
+    }
+    if ($s -notmatch '^[A-Za-z]:\\') { return '' }
+    return $s
+}
+
+<#
+.SYNOPSIS
+    检测卸载残留:孤儿卸载注册表项与遗留数据目录
+.DESCRIPTION
+    1) 枚举 HKLM/HKCU Uninstall 键:UninstallString 指向的 .exe/.msi 不存在,或 InstallLocation 非空且目录不存在 → 孤儿项(HKCU=caution,HKLM=admin,action=registryKey,regKeys 供清理删键);
+    2) 扫描 %APPDATA%/%LOCALAPPDATA%/%ProgramData% 顶层目录:规范化名称与已安装软件名/发布商名比对(相等或前缀互含视为匹配),匹配不到且不在内置排除清单 → 疑似残留(caution,action=toRecycle 移入回收站);
+    3) 总数上限 80,名称无法规范化或解析失败的保守跳过。
+    返回值：目标数组,无残留时返回 @()
+.EXAMPLE
+    $residue = Get-UninstallResidueTargets
+#>
+function Get-UninstallResidueTargets {
+    $cap = 80
+    $list = New-Object System.Collections.Generic.List[object]
+
+    # ---- 已安装软件收集 + 孤儿注册表项检测 ----
+    $roots = @(
+        @{ hive = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall';             tag = 'hklm';  admin = $true  },
+        @{ hive = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'; tag = 'hklm32'; admin = $true  },
+        @{ hive = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall';             tag = 'hkcu';  admin = $false }
+    )
+    $nameNorms = New-Object System.Collections.Generic.List[string]
+    $orphans   = @()
+
+    foreach ($r in $roots) {
+        if (-not (Test-Path -LiteralPath $r.hive)) { continue }
+        foreach ($key in @(Get-ChildItem -LiteralPath $r.hive -ErrorAction SilentlyContinue)) {
+            $p = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            if (-not $p.DisplayName) { continue }
+            $nameNorms.Add((Get-NormName -Name ([string]$p.DisplayName)))
+            if ($p.Publisher) { $nameNorms.Add((Get-NormName -Name ([string]$p.Publisher))) }
+
+            $exe = Get-UninstallExePath -UninstallString ([string]$p.UninstallString)
+            $loc = ([string]$p.InstallLocation).Trim()
+            $exeMissing = $exe -and -not (Test-Path -LiteralPath $exe)
+            $locMissing = ($loc -match '^[A-Za-z]:\\') -and -not (Test-Path -LiteralPath $loc)
+            if (-not ($exeMissing -or $locMissing)) { continue }
+
+            $evid = @()
+            if ($exeMissing) { $evid += "卸载程序已不存在($exe)" }
+            if ($locMissing) { $evid += "安装目录已不存在($loc)" }
+            $slug = "$($r.tag)-" + (($key.PSChildName -replace '[^A-Za-z0-9_-]', '-').ToLower())
+            $orphans += @{
+                id          = "orphan-reg-$slug"
+                name        = "失效卸载项 · $($p.DisplayName)"
+                paths       = @()
+                regKeys     = @([string]$key.PSPath)
+                description = "「$($p.DisplayName)」的卸载注册表项,$($evid -join ';'),已无法正常卸载。清理将删除该失效注册表项。"
+                risk        = if ($r.admin) { 'admin' } else { 'caution' }
+                action      = 'registryKey'
+            }
+        }
+    }
+    foreach ($o in $orphans) {
+        if ($list.Count -ge $cap) { break }
+        $list.Add([pscustomobject]$o)
+    }
+
+    # ---- 残留数据目录检测 ----
+    # 内置排除清单:厂商根目录、系统/工具通用目录,命中绝不列出(防误报第一道防线)
+    $exclude = @(
+        'microsoft','windows','google','chrome','mozilla','firefox','adobe','apple','intel','nvidia','amd',
+        'oracle','java','dotnet','jetbrains','tencent','alibaba','baidu','netease','huawei','xiaomi','bytedance',
+        'kingsoft','wps','qihoo','360safe','steam','epic','vmware','programs','packages','temp','tmp','squirreltemp',
+        'crashdumps','d3dscache','comms','connecteddevicesplatform','crypto','virtualstore','iconcache','cache',
+        'logs','pip','npm','npmcache','yarn','pnpm','nuget','gocache','gobuild','code','vscode','electron',
+        'updater','webview','cef','cefsharp','mssdk','lenovo','appleinc','applecomputer','visualstudiosetup'
+    )
+    foreach ($rootEnv in @($env:APPDATA, $env:LOCALAPPDATA, $env:ProgramData)) {
+        if (-not $rootEnv -or -not (Test-Path -LiteralPath $rootEnv)) { continue }
+        foreach ($dir in @(Get-ChildItem -LiteralPath $rootEnv -Directory -Force -ErrorAction SilentlyContinue)) {
+            if ($list.Count -ge $cap) { break }
+            if (($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if ($dir.Name.StartsWith('.') -or $dir.Name.StartsWith('@')) { continue }   # 隐藏工具目录(如 .lingma、@xxx)保守跳过
+            $dn = Get-NormName -Name $dir.Name
+            if (-not $dn) { continue }                                       # 无法规范化 → 保守跳过
+            if ($exclude -contains $dn) { continue }                          # 排除清单
+            if (Test-NameMatch -DirNorm $dn -Norms $nameNorms) { continue }   # 匹配到已安装软件/发布商
+            $slug = ($dir.FullName -replace '[:\\]', '-').ToLower()
+            $list.Add([pscustomobject]@{
+                id          = "orphan-dir-$slug"
+                name        = "疑似卸载残留 · $($dir.Name)"
+                paths       = @($dir.FullName)
+                regKeys     = @()
+                description = "位于 $($dir.FullName),未匹配到任何已安装软件,可能是卸载后遗留的数据目录。清理将移入回收站,误删可恢复。"
+                risk        = 'caution'
+                action      = 'toRecycle'
+            })
+        }
+    }
+
+    # 注:PS5.1 下 @() 包裹 List[object] 会触发装箱 binder 异常,这里用 ToArray()
+    return $list.ToArray()
+}
+
+<#
+.SYNOPSIS
     合并内置、自定义与开发盘动态清理目标
 .DESCRIPTION
     内置项在前、自定义项与开发盘动态项在后；按 id 去重(自定义/动态项覆盖同 id 内置项)。
@@ -279,10 +434,12 @@ function Merge-Targets {
     $builtin = Get-BuiltinTargets
     $custom  = Get-CustomTargets
     $dev     = Get-DevTargets
+    $residue = Get-UninstallResidueTargets
     $map = @{}
     foreach ($t in $builtin) { $map[$t.id] = $t }
     foreach ($t in $custom)  { $map[$t.id] = $t }
     foreach ($t in $dev)     { $map[$t.id] = $t }
+    foreach ($t in $residue) { $map[$t.id] = $t }
     return @($map.Values)
 }
 
@@ -377,7 +534,10 @@ $script:ScanBody = {
     $list = New-Object System.Collections.Generic.List[object]
     foreach ($t in @($targets)) {
         $sync.Current = $t.name
-        $reals = Expand-TargetRealPath -Patterns @($t.paths)
+        $reals = @()
+        if ($t.action -ne 'registryKey') {
+            $reals = Expand-TargetRealPath -Patterns @($t.paths)
+        }
         $size  = [long]0
         $files = [long]0
         foreach ($r in $reals) {
@@ -393,6 +553,7 @@ $script:ScanBody = {
             description = $t.description
             risk        = $t.risk
             action      = $t.action
+            regKeys     = @($t.regKeys)
             size        = $size
             files       = $files
             status      = ''
@@ -525,10 +686,64 @@ $script:CleanBody = {
         $reals = @()
         foreach ($r in @($t.real)) { if ($r) { $reals += $r } }
         $failed = 0
+        $regDeleted = 0
+        $lastErr = ''
 
         if ($t.action -eq 'recyclebin') {
             try { Clear-RecycleBin -Force -ErrorAction Stop } catch { $failed++ }
-        } else {
+        }
+        elseif ($t.action -eq 'toRecycle') {
+            # 整目录移入回收站(可恢复),用于卸载残留目录
+            # 注:Shell 回收站操作在后台 Runspace 的 MTA 线程会返回 120(不支持),
+            #     VB FileSystem 同样失败,故用 C# 助手在独立 STA 线程内执行 SHFileOperation
+            if (-not ('CDriveShell' -as [type])) {
+                Add-Type -TypeDefinition @'
+using System;
+using System.Threading;
+using System.Runtime.InteropServices;
+public static class CDriveShell {
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    public struct SHFILEOPSTRUCT {
+        public IntPtr hwnd; public uint wFunc; public string pFrom; public string pTo;
+        public ushort fFlags; public bool fAnyOperationsAborted; public IntPtr hNameMappings;
+        public string lpszProgressTitle;
+    }
+    [DllImport("shell32.dll", CharSet=CharSet.Unicode)]
+    public static extern int SHFileOperation(ref SHFILEOPSTRUCT lpFileOp);
+
+    // 在独立 STA 线程执行回收站删除(MTA 线程下 Shell 操作返回 120)
+    public static int RecycleDir(string path) {
+        int rc = 0; bool aborted = false;
+        var t = new Thread(() => {
+            var op = new SHFILEOPSTRUCT();
+            op.wFunc = 3; op.pFrom = path + "\0\0"; op.fFlags = 0x54;   // FO_DELETE | ALLOWUNDO|NOCONFIRMATION|SILENT
+            rc = SHFileOperation(ref op); aborted = op.fAnyOperationsAborted;
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        if (!t.Join(20000)) { t.Abort(); return -2000; }   // 超时兜底,避免极端情况下永久挂起
+        return aborted ? -1000 : rc;
+    }
+}
+'@
+            }
+            foreach ($r in $reals) {
+                if (-not (Test-Path -LiteralPath $r)) { continue }
+                try {
+                    $rc = [CDriveShell]::RecycleDir($r)
+                    if ($rc -ne 0) { $failed++; $lastErr = "SHFileOperation 返回码 $rc" }
+                } catch { $failed++; $lastErr = $_.Exception.Message }
+            }
+        }
+        elseif ($t.action -eq 'registryKey') {
+            # 删除失效卸载注册表键(HKCU 可直接删,HKLM 需管理员)
+            foreach ($k in @($t.regKeys)) {
+                if (-not $k -or -not (Test-Path -LiteralPath $k)) { continue }
+                try { Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction Stop; $regDeleted++ } catch { $failed++ }
+            }
+            $reals = @()
+        }
+        else {
             foreach ($r in $reals) {
                 $item = Get-Item -LiteralPath $r -Force -ErrorAction SilentlyContinue
                 if (-not $item) { continue }
@@ -555,9 +770,19 @@ $script:CleanBody = {
         $releasedTotal += $released
         $t.size = $after
 
-        if ($t.action -eq 'recyclebin') {
+        if ($t.action -eq 'registryKey') {
+            if ($regDeleted -gt 0 -and $failed -eq 0) { $t.status = 'done';    $t.message = "已删除 $regDeleted 个失效注册表项" }
+            elseif ($regDeleted -gt 0)                { $t.status = 'partial'; $t.message = "已删除 $regDeleted 个,其余需要管理员权限" }
+            else                                      { $t.status = 'partial'; $t.message = "未能删除注册表项(需要以管理员身份运行)" }
+        }
+        elseif ($t.action -eq 'recyclebin') {
             if ($failed -gt 0) { $t.status = 'partial'; $t.message = '部分项目被占用，未能完全清空' }
             else               { $t.status = 'done';    $t.message = "已清空回收站，释放 $(Format-Bytes -Bytes $released)" }
+        }
+        elseif ($t.action -eq 'toRecycle') {
+            if ($failed -gt 0 -and $after -gt 0) { $t.status = 'partial'; $t.message = "已移入回收站 $(Format-Bytes -Bytes $released)，部分文件被占用($lastErr)" }
+            elseif ($failed -gt 0)               { $t.status = 'partial'; $t.message = "移入回收站失败($lastErr)" }
+            else                                 { $t.status = 'done';    $t.message = "已移入回收站 $(Format-Bytes -Bytes $released)，误删可恢复" }
         }
         elseif ($failed -gt 0 -and $after -gt 0) {
             $t.status = 'partial'; $t.message = "已释放 $(Format-Bytes -Bytes $released)，部分文件被占用跳过"
@@ -760,7 +985,7 @@ function toast(msg){
 }
 
 function visibleRows(){
-  return (st.results || []).filter(function(t){ return t.size > 0; });
+  return (st.results || []).filter(function(t){ return t.size > 0 || t.action === 'registryKey'; });
 }
 
 function render(){
