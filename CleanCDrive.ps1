@@ -27,7 +27,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # 应用版本与发布仓库(更新检测/一键升级用;发布时打 v* tag 触发 CI 发版)
-$script:Version = '1.1.2'
+$script:Version = '1.2.0'
 $script:Repo    = 'jcbowen/cdrive-cleaner'
 
 #region ---------------- 全局配置 ----------------
@@ -132,6 +132,22 @@ function Get-BuiltinTargets {
             description='Edge 浏览器网页缓存，删除后首次打开网页稍慢。浏览器运行时部分文件会被占用而跳过。' }
         @{ id='chrome_cache';       name='Chrome 浏览器缓存';  paths=@("$envL\Google\Chrome\User Data\*\Cache", "$envL\Google\Chrome\User Data\*\Code Cache"); risk='safe'; action='deleteContents'
             description='Chrome 浏览器网页缓存，删除后首次打开网页稍慢。浏览器运行时部分文件会被占用而跳过。' }
+        @{ id='nuget_cache';        name='NuGet 包缓存';       paths=@("$envU\.nuget\packages");                           risk='safe';    action='deleteContents'
+            description='NuGet/.NET 的包缓存，删除后已还原的项目不受影响，下次还原/编译时自动重新下载。' }
+        @{ id='maven_repo';         name='Maven 本地仓库';     paths=@("$envU\.m2\repository");                            risk='safe';    action='deleteContents'
+            description='Maven 下载的依赖包仓库，删除不影响源码，但 Java 项目需重新下载依赖才能编译，不常用 Maven 时可放心清。' }
+        @{ id='gradle_caches';      name='Gradle 缓存';        paths=@("$envU\.gradle\caches");                            risk='safe';    action='deleteContents'
+            description='Gradle 的依赖与构建缓存，删除后已装项目不受影响，下次构建会重新下载并重建缓存。' }
+        @{ id='cargo_registry';     name='Cargo 注册表缓存';   paths=@("$envU\.cargo\registry");                           risk='safe';    action='deleteContents'
+            description='Rust Cargo 下载的 crate 缓存，删除后已编译项目不受影响，下次构建时重新下载。' }
+        @{ id='huggingface_cache';  name='HuggingFace 模型缓存'; paths=@("$envU\.cache\huggingface");                      risk='caution'; action='deleteContents'
+            description='HuggingFace 下载的模型/数据集缓存，体积通常很大；删除后需重新下载模型(可能较慢)，不使用 AI 工具时可清。' }
+        @{ id='vscode_cache';       name='VS Code 缓存';       paths=@("$envL\Microsoft\VS Code\Cache", "$envL\Microsoft\VS Code\CachedData", "$envL\Microsoft\VS Code\Code Cache", "$envL\Microsoft\VS Code\GPUCache"); risk='safe'; action='deleteContents'
+            description='VS Code 编辑器的网页/编译/GPU 缓存，删除不影响配置与插件，首次启动会稍慢。' }
+        @{ id='d3dscache';          name='D3D 着色器缓存';     paths=@("$envL\D3DSCache");                                 risk='safe';    action='deleteContents'
+            description='DirectX 着色器缓存，删除后游戏/图形应用首次启动会重新编译着色器，稍慢但无影响。' }
+        @{ id='windows_wer';        name='Windows 错误报告';   paths=@("$envL\Microsoft\Windows\WER");                     risk='safe';    action='deleteContents'
+            description='Windows 错误报告的队列与存档文件，仅用于诊断反馈，可安全删除。' }
         @{ id='crash_dumps';        name='崩溃转储文件';       paths=@("$envL\CrashDumps");                                risk='safe';    action='deleteContents'
             description='程序崩溃时生成的转储文件，仅用于排查故障，可安全删除。' }
         @{ id='thumbnails';         name='缩略图缓存';         paths=@("$envL\Microsoft\Windows\Explorer\thumbcache_*.db"); risk='safe';   action='deleteContents'
@@ -179,9 +195,82 @@ function Get-CustomTargets {
 
 <#
 .SYNOPSIS
-    合并内置与自定义清理目标
+    发现非 C 盘固定磁盘上的开发产物目录(node_modules/dist/build/target)
 .DESCRIPTION
-    内置项在前、自定义项在后；按 id 去重(自定义项覆盖同 id 内置项)。
+    仅扫描 C 以外的固定磁盘，自盘符根向下最多 3 层枚举目录：
+    命中 marker 名(node_modules/dist/build/target)即生成清理项且不深入其内部(避免嵌套重复)；
+    跳过 $ 开头/`.` 开头与系统常见目录，跳过重解析点；总数上限 60 项防止异常目录树拖慢扫描。
+    每项 risk=caution(默认不勾选)，id 由类型 + 路径化名构成(确定性，供清理白名单校验)。
+    返回值：目标对象数组(结构与内置项一致)，无其他固定盘时返回 @()
+.EXAMPLE
+    $dev = Get-DevTargets
+#>
+function Get-DevTargets {
+    $drives = @()
+    try {
+        $drives = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.DeviceID.TrimEnd(':') } | Where-Object { $_ -ne 'C' })
+    } catch { return @() }
+    if (-not $drives.Count) { return @() }
+
+    $markers  = @{ node_modules = 'node_modules 依赖'; dist = 'dist 构建产物'; build = 'build 构建产物'; target = 'target 构建产物' }
+    $skipDirs = @('Windows', 'Program Files', 'Program Files (x86)', 'ProgramData', 'System Volume Information', 'Recovery')
+    $maxDepth = 3
+    $cap      = 60
+    $found    = New-Object System.Collections.Generic.List[object]
+
+    foreach ($letter in $drives) {
+        $stack = New-Object System.Collections.Generic.Stack[object]
+        $stack.Push(@{ path = "${letter}:\"; depth = 0 })
+        while ($stack.Count -gt 0 -and $found.Count -lt $cap) {
+            $cur = $stack.Pop()
+            if ($cur.depth -ge $maxDepth) { continue }
+            try { $children = [System.IO.Directory]::EnumerateDirectories($cur.path) } catch { continue }
+            foreach ($child in $children) {
+                if ($found.Count -ge $cap) { break }
+                $name = [System.IO.Path]::GetFileName($child)
+                if ($name.StartsWith('$') -or $name.StartsWith('.')) { continue }
+                if ($skipDirs -contains $name) { continue }
+                $lower = $name.ToLower()
+                if ($markers.ContainsKey($lower)) {
+                    $found.Add(@{ kind = $lower; full = $child; project = (Split-Path -Path $child -Parent | Split-Path -Leaf) })
+                    continue
+                }
+                try {
+                    $di = New-Object System.IO.DirectoryInfo($child)
+                    if (($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                } catch { continue }
+                $stack.Push(@{ path = $child; depth = $cur.depth + 1 })
+            }
+        }
+    }
+
+    $descMap = @{
+        node_modules = 'npm 项目依赖目录，删除不影响源码，但需重新执行 npm install 才能构建/运行。'
+        dist         = '前端/通用构建产物，可由构建命令重新生成，删除后需重新构建。'
+        build        = '构建产物目录，可由构建命令重新生成，删除后需重新构建。'
+        target       = 'Rust/Cargo 构建产物，删除后下次 cargo build 自动重建，首次构建较慢。'
+    }
+    $list = @()
+    foreach ($f in $found) {
+        $slug = ($f.full -replace '[:\\]', '-').ToLower()
+        $list += @{
+            id          = "dev-$($f.kind)-$slug"
+            name        = "$($markers[$f.kind]) · $($f.project)"
+            paths       = @($f.full)
+            description = "项目「$($f.project)」的$($descMap[$f.kind])"
+            risk        = 'caution'
+            action      = 'deleteContents'
+        }
+    }
+    return $list
+}
+
+<#
+.SYNOPSIS
+    合并内置、自定义与开发盘动态清理目标
+.DESCRIPTION
+    内置项在前、自定义项与开发盘动态项在后；按 id 去重(自定义/动态项覆盖同 id 内置项)。
     返回值：目标数组
 .EXAMPLE
     $all = Merge-Targets
@@ -189,9 +278,11 @@ function Get-CustomTargets {
 function Merge-Targets {
     $builtin = Get-BuiltinTargets
     $custom  = Get-CustomTargets
+    $dev     = Get-DevTargets
     $map = @{}
     foreach ($t in $builtin) { $map[$t.id] = $t }
     foreach ($t in $custom)  { $map[$t.id] = $t }
+    foreach ($t in $dev)     { $map[$t.id] = $t }
     return @($map.Values)
 }
 
@@ -250,6 +341,22 @@ function Format-Bytes {
     if ($Bytes -ge 1KB) { return ('{0:N1} KB' -f ($Bytes / 1KB)) }
     return ('{0} B' -f [int]$Bytes)
 }
+
+function Get-DiskUsages {
+    $out = @()
+    $disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue
+    $ordered = @($disks | Sort-Object -Property @{ Expression = { if ($_.DeviceID -eq 'C:') { 0 } else { 1 } } }, DeviceID)
+    foreach ($d in $ordered) {
+        if ([double]$d.Size -le 0) { continue }
+        $out += @{
+            letter = [string]$d.DeviceID.TrimEnd(':')
+            used   = [double]($d.Size - $d.FreeSpace)
+            free   = [double]$d.FreeSpace
+            total  = [double]$d.Size
+        }
+    }
+    return $out
+}
 '@
 
 #endregion
@@ -300,8 +407,10 @@ $script:ScanBody = {
     $sync.Current = ''
     $sync.Results = $list.ToArray()
 
-    $d = Get-PSDrive -Name 'C'
-    $sync.Disk = @{ used = [double]$d.Used; free = [double]$d.Free; total = ([double]$d.Used + [double]$d.Free) }
+    $disks = Get-DiskUsages
+    $sync.Disks = $disks
+    $c = $disks | Where-Object { $_.letter -eq 'C' } | Select-Object -First 1
+    if ($c) { $sync.Disk = $c }
 }
 
 <#
@@ -466,8 +575,10 @@ $script:CleanBody = {
     $clean.current = ''
     $sync.LastReleased = $releasedTotal
 
-    $d = Get-PSDrive -Name 'C'
-    $sync.Disk = @{ used = [double]$d.Used; free = [double]$d.Free; total = ([double]$d.Used + [double]$d.Free) }
+    $disks = Get-DiskUsages
+    $sync.Disks = $disks
+    $c = $disks | Where-Object { $_.letter -eq 'C' } | Select-Object -First 1
+    if ($c) { $sync.Disk = $c }
 }
 
 <#
@@ -532,6 +643,12 @@ h1{font-size:22px}
 .ring .fgc{stroke:var(--acc);transition:stroke-dashoffset .6s}
 .disk-info{font-size:13px;color:var(--tx2);line-height:1.7}
 .disk-info b{color:var(--tx);font-size:16px}
+#disks{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.ditem{display:flex;align-items:center;gap:10px}
+.ditem .ring{width:84px;height:84px}
+.ditem.multi .ring{width:62px;height:62px}
+.ditem.multi .disk-info{font-size:12px}
+.ditem.multi .disk-info b{font-size:13px}
 #progress{padding:12px 28px;font-size:13px;color:var(--tx2);display:none;align-items:center;gap:12px}
 .pbar{flex:1;max-width:460px;height:6px;background:#243349;border-radius:3px;overflow:hidden}
 .pbar i{display:block;height:100%;background:linear-gradient(90deg,#38bdf8,#818cf8);width:0%;transition:width .4s;border-radius:3px}
@@ -591,13 +708,7 @@ footer{position:fixed;left:0;right:0;bottom:0;background:rgba(15,23,42,.92);back
 <body>
 <header>
   <div><h1>C盘清理助手<span class="sub" id="port"></span></h1></div>
-  <div class="disk">
-    <svg class="ring" viewBox="0 0 100 100">
-      <circle class="bgc" cx="50" cy="50" r="42"></circle>
-      <circle class="fgc" id="ringfg" cx="50" cy="50" r="42" stroke-dasharray="263.9" stroke-dashoffset="263.9"></circle>
-    </svg>
-    <div class="disk-info" id="diskinfo">等待扫描…</div>
-  </div>
+  <div class="disk" id="disks"><div class="disk-info">等待扫描…</div></div>
 </header>
 <div id="updbanner"><span>发现新版本 <b id="updver"></b>(当前 <span id="updcur"></span>)</span><button class="btn primary" onclick="doUpgrade()">立即升级</button><button class="mini" onclick="hideUpd()">忽略</button></div>
 <div id="updmask" style="display:none"><div class="mbox"><div class="spin"></div><div id="updmsg">正在升级…</div></div></div>
@@ -682,11 +793,25 @@ function render(){
     document.title = TITLE;
   }
 
-  if (st.disk) {
+  if (st.disks && st.disks.length) {
+    var C = 263.9, multi = st.disks.length > 1, dhtml = '';
+    st.disks.forEach(function(d){
+      var pct = d.total > 0 ? d.used / d.total : 0;
+      var fc = d.free < 5368709120 ? '#f87171' : '#4ade80';
+      dhtml += '<div class="ditem' + (multi ? ' multi' : '') + '">'
+        + '<svg class="ring" viewBox="0 0 100 100"><circle class="bgc" cx="50" cy="50" r="42"></circle>'
+        + '<circle class="fgc" cx="50" cy="50" r="42" stroke-dasharray="263.9" stroke-dashoffset="' + (C * (1 - pct)).toFixed(1) + '"></circle></svg>'
+        + '<div class="disk-info">' + esc(d.letter) + ': <b>' + fmt(d.used) + '</b> / ' + fmt(d.total)
+        + '<br>剩余 <b style="color:' + fc + '">' + fmt(d.free) + '</b></div></div>';
+    });
+    document.getElementById('disks').innerHTML = dhtml;
+  } else if (st.disk) {
     var u = st.disk.used, f = st.disk.free, tt = st.disk.total;
-    var C = 263.9;
-    document.getElementById('ringfg').setAttribute('stroke-dashoffset', (C * (1 - u / tt)).toFixed(1));
-    document.getElementById('diskinfo').innerHTML = '<b>' + fmt(u) + '</b> 已用 / ' + fmt(tt) + '<br>剩余 <b style="color:' + (f < 5368709120 ? '#f87171' : '#4ade80') + '">' + fmt(f) + '</b>';
+    var off = (263.9 * (1 - u / tt)).toFixed(1);
+    document.getElementById('disks').innerHTML = '<div class="ditem">'
+      + '<svg class="ring" viewBox="0 0 100 100"><circle class="bgc" cx="50" cy="50" r="42"></circle>'
+      + '<circle class="fgc" cx="50" cy="50" r="42" stroke-dasharray="263.9" stroke-dashoffset="' + off + '"></circle></svg>'
+      + '<div class="disk-info"><b>' + fmt(u) + '</b> 已用 / ' + fmt(tt) + '<br>剩余 <b style="color:' + (f < 5368709120 ? '#f87171' : '#4ade80') + '">' + fmt(f) + '</b></div></div>';
   }
 
   var vis = visibleRows();
@@ -935,6 +1060,7 @@ function Get-StatusPayload {
         current      = [string]$script:Sync.Current
         results      = $r
         disk         = $script:Sync.Disk
+        disks        = @($script:Sync.Disks)
         clean        = $clean
         lastReleased = [double]$script:Sync.LastReleased
         isadmin      = $script:IsAdmin
@@ -1210,6 +1336,7 @@ $script:Sync.Total       = 0
 $script:Sync.Current     = ''
 $script:Sync.Results     = @()
 $script:Sync.Disk        = $null
+$script:Sync.Disks       = @()
 $script:Sync.Clean       = @{ state = 'idle'; done = 0; total = 0; current = '' }
 $script:Sync.LastReleased = [double]0
 $script:Sync.Update       = @{ available = $false; phase = 'idle'; error = ''; current = $script:Version; version = ''; assetUrl = ''; zipballUrl = '' }
