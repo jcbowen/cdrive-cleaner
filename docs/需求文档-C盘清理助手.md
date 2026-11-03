@@ -179,3 +179,48 @@ C 盘（80GB）仅剩约 1.9GB，经扫描发现大量可清理的缓存/临时�
 ### 4. 验收
 - [x] 浏览器实测:页面打开(伪 v1.0.5)→ 置 upgrading 状态 → 服务替换为 v1.1.2 → 页面**自动 reload**,页脚变为 v1.1.2,`bootVer` 重置为新值,控制台无 JS 错误;
 - 备注:沙箱测试环境中"升级器启动的新服务不出现"为 Job Object 对孙进程创建限制的测试伪象(真实双击 bat 无此问题);升级链路本身已在 v1.0.5→v1.0.9 端到端验证通过。
+
+## 十一、多盘扫描与清理项扩充(2026-11-03 确认,v1.2.0)
+
+### 1. 背景与目标
+- 内置清单缺少部分通用开发缓存(NuGet/Maven/Gradle/Cargo/HuggingFace 等),同机开发环境清理不彻底;
+- 磁盘用量此前硬编码 C 盘,多盘用户无法查看 D/E 盘用量;
+- 开发项目常放在 D 盘,node_modules 与构建产物(dist/build/target)占用可观,但路径因人而异,无法内置固定清单 → 需要动态发现。
+
+### 2. C 盘清理项扩充(8 项通用缓存)
+
+| id | 名称 | 路径 | 风险 |
+|---|---|---|---|
+| nuget_cache | NuGet 包缓存 | %USERPROFILE%\.nuget\packages | 安全 |
+| maven_repo | Maven 本地仓库 | %USERPROFILE%\.m2\repository | 安全 |
+| gradle_caches | Gradle 缓存 | %USERPROFILE%\.gradle\caches | 安全 |
+| cargo_registry | Cargo 注册表缓存 | %USERPROFILE%\.cargo\registry | 安全 |
+| huggingface_cache | HuggingFace 模型缓存 | %USERPROFILE%\.cache\huggingface | 谨慎 |
+| vscode_cache | VS Code 缓存 | %LOCALAPPDATA%\Microsoft\VS Code 下 Cache/CachedData/Code Cache/GPUCache | 安全 |
+| d3dscache | D3D 着色器缓存 | %LOCALAPPDATA%\D3DSCache | 安全 |
+| windows_wer | Windows 错误报告 | %LOCALAPPDATA%\Microsoft\Windows\WER | 安全 |
+
+### 3. 多盘用量支持
+- 动态检测所有固定磁盘(Win32_LogicalDisk DriveType=3),C 盘必显,其余按盘符排序追加;
+- `/api/status` 下发 `disks` 数组(letter/used/free/total),保留原 `disk` 字段为 C 盘数据兼容旧逻辑;
+- 前端头部按盘渲染多个环形图,多盘时缩小尺寸并标注盘符。
+
+### 4. 开发盘动态项(仅扫描 C 以外的固定盘)
+- 扫描时动态发现 node_modules / dist / build / target 目录(自盘符根向下最多 3 层,跳过 `$` 开头/`.` 开头/系统目录,不深入 marker 目录内部,避免嵌套重复与误报);
+- 每个发现目录作为独立清理项:`id=dev-<类型>-<路径化名>`,名称带所属项目名,risk=caution(默认不勾选,需用户主动选择);
+- 数量上限 60 项,防止异常目录树拖慢扫描;清理语义同普通项(删除目录内容,保留目录本身);
+- 描述明确"删除后果":node_modules 需重新 npm install;构建产物由构建命令重新生成。
+
+### 5. 验收标准
+- [ ] C 盘新 8 项在页面正确出现并统计大小(不存在的自动隐藏);
+- [ ] D 盘存在时头部显示 C/D 多环形图,用量准确;
+- [ ] D 盘 node_modules/dist/build/target 被发现并显示为谨慎项,默认不勾选;
+- [ ] 勾选 D 盘项可正常清理并反馈释放量,清理后磁盘用量刷新。
+
+### 6. 执行结果(2026-11-03 完成)
+
+- [x] 主脚本:Get-BuiltinTargets 补 8 项;新增 Get-DevTargets(非 C 固定盘深度≤3 动态发现)并入 Merge-Targets;FSSource 注入 Get-DiskUsages(多盘,DriveType=3,C 盘优先);扫描/清理线程结束写 `Sync.Disks`;`/api/status` 新增 `disks` 数组;前端头部多环形图(多盘缩小+盘符标注,保留单盘兼容);版本号升至 1.2.0;
+- [x] API 实测:status.version=1.2.0、disks=C 65.8/80GB+D 125.4/143.6GB、8 项新目标注册(未安装的 size=0 自动隐藏)、D 盘发现 5 个真实 node_modules(nvm 版本目录);
+- [x] 动态项全链路实测:D 盘测试夹具 node_modules 被发现(dev-node_modules-* id)→ 勾选清理 → status=done、释放量正确、目录清空、磁盘用量刷新;
+- [x] 浏览器 UI 实测:C/D 双环形图正常渲染、动态项带"谨慎"徽章且默认不勾选、页脚 v1.2.0、控制台无 JS 错误;
+- 备注:沙箱测试中夹具首测报"文件被占用"为沙箱对非白名单目录删除限制的环境伪象(手动 Remove-Item 同样被拒),沙箱可写目录内夹具全链路验证通过;真实环境无此限制。
